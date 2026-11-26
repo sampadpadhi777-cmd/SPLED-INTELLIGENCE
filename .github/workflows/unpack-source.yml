@@ -1,9 +1,10 @@
-name: SPLED INTELLIGENCE - Final Extract, Validate and APK Build
+name: SPLED INTELLIGENCE - Extract, Test and Build APK
 
 "on":
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - 'SPLED_INTELLIGENCE*.zip'
       - '.github/workflows/unpack-source.yml'
@@ -12,7 +13,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: spled-intelligence-final-${{ github.ref }}
+  group: spled-intelligence-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,7 +35,7 @@ jobs:
           set -euo pipefail
           mapfile -t archives < <(find . -maxdepth 1 -type f -iname 'SPLED_INTELLIGENCE*.zip' -print)
           if [[ ${#archives[@]} -ne 1 ]]; then
-            echo "Expected exactly one SPLED_INTELLIGENCE*.zip at repository root; found ${#archives[@]}"
+            echo "Expected exactly one SPLED_INTELLIGENCE*.zip in repository root; found ${#archives[@]}"
             printf '%s\n' "${archives[@]}"
             exit 1
           fi
@@ -43,7 +44,7 @@ jobs:
           unzip -t "$archive"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Extract and verify project
+      - name: Extract and verify project files
         shell: bash
         run: |
           set -euo pipefail
@@ -51,7 +52,8 @@ jobs:
           unzip -q "${{ steps.archive.outputs.archive }}" -d "$RUNNER_TEMP/spled-source"
           PROJECT="$RUNNER_TEMP/spled-source/SPLED_INTELLIGENCE"
           for file in \
-            README.md BUILD_STATUS.md \
+            README.md \
+            BUILD_STATUS.md \
             android/settings.gradle.kts \
             android/build.gradle.kts \
             android/app/build.gradle.kts \
@@ -59,33 +61,15 @@ jobs:
             backend/requirements.txt \
             backend/research/requirements.txt \
             backend/research/train_walkforward.py; do
-            test -s "$PROJECT/$file" || { echo "Missing required file: $file"; exit 1; }
+            test -s "$PROJECT/$file" || { echo "Missing required file: $PROJECT/$file"; exit 1; }
           done
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Project source structure verified."
+          echo "Project structure verified."
 
-      - name: Prepare Android-compatible Kotlin plugin version
+      - name: Copy source into repository (preserve active workflow)
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          p = Path("$RUNNER_TEMP")
-          project = Path(__import__("os").environ["RUNNER_TEMP"]) / "spled-source" / "SPLED_INTELLIGENCE"
-          gradle_file = project / "android" / "build.gradle.kts"
-          text = gradle_file.read_text()
-          text = text.replace('id("org.jetbrains.kotlin.android") version "2.0.21"', 'id("org.jetbrains.kotlin.android") version "2.1.21"')
-          text = text.replace('id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"', 'id("org.jetbrains.kotlin.plugin.compose") version "2.1.21"')
-          gradle_file.write_text(text)
-          print(gradle_file.read_text())
-          PY
-
-      - name: Copy project source into repository
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Keep the active repository workflow. Do not copy nested workflows
-          # from the ZIP because updating workflow files needs extra permission.
           rsync -a \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -104,25 +88,30 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           if ! git diff --cached --quiet; then
-            git commit -m 'Extract and prepare SPLED INTELLIGENCE source'
+            git commit -m 'Extract SPLED INTELLIGENCE v0.8.0 source'
             git push origin HEAD:main
           else
-            echo 'No source changes to commit.'
+            echo 'Source files already up to date.'
           fi
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/research/requirements.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r backend/requirements.txt -r backend/research/requirements.txt
+          python -m pip install pytest -r backend/requirements.txt -r backend/research/requirements.txt
 
-      - name: Compile Python and run all tests
+      - name: Compile Python and run tests
         env:
           PYTHONPATH: backend
+        shell: bash
         run: |
           set -euo pipefail
           python -m py_compile backend/app/*.py backend/research/*.py
@@ -141,28 +130,20 @@ jobs:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
 
-      - name: Install and verify Android SDK packages
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --install 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
           sdkmanager --list_installed
 
       - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-
-      - name: Verify Android build configuration
-        working-directory: android
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -q 'com.android.application.*8.8.2' ../android/build.gradle.kts
-          grep -q 'org.jetbrains.kotlin.android.*2.1.21' ../android/build.gradle.kts
-          grep -q 'org.jetbrains.kotlin.plugin.compose.*2.1.21' ../android/build.gradle.kts
-          java -version
-          gradle --version
 
       - name: Run Android unit tests and build debug APK
         working-directory: android
@@ -191,7 +172,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload diagnostics and test reports
+      - name: Upload build diagnostics and test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
