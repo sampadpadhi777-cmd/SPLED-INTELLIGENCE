@@ -1,1 +1,190 @@
+name: SPLED INTELLIGENCE - Extract, Test and Build APK
 
+"on":
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'SPLED_INTELLIGENCE*.zip'
+      - '.github/workflows/unpack-source.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spled-intelligence-main
+  cancel-in-progress: false
+
+jobs:
+  extract-test-build:
+    name: Extract source, test and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find and verify source ZIP
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find . -maxdepth 1 -type f -iname 'SPLED_INTELLIGENCE*.zip' -print)
+          if [[ "${#archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one SPLED_INTELLIGENCE*.zip in repository root; found ${#archives[@]}"
+            printf '%s\n' "${archives[@]}"
+            exit 1
+          fi
+          archive="${archives[0]}"
+          test -s "$archive"
+          unzip -t "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Extract and verify source package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/spled-source"
+          unzip -q "${{ steps.archive.outputs.archive }}" -d "$RUNNER_TEMP/spled-source"
+          PROJECT="$RUNNER_TEMP/spled-source/SPLED_INTELLIGENCE"
+          test -s "$PROJECT/README.md"
+          test -s "$PROJECT/BUILD_STATUS.md"
+          test -s "$PROJECT/android/settings.gradle.kts"
+          test -s "$PROJECT/android/build.gradle.kts"
+          test -s "$PROJECT/android/app/build.gradle.kts"
+          test -s "$PROJECT/android/app/src/main/AndroidManifest.xml"
+          test -s "$PROJECT/backend/requirements.txt"
+          test -s "$PROJECT/backend/research/requirements.txt"
+          test -s "$PROJECT/backend/research/train_walkforward.py"
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Source structure verified."
+
+      - name: Copy source into repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Do not copy the ZIP's nested .github workflows. The current workflow
+          # is already running; pushing another workflow file requires a separate
+          # workflows permission and is intentionally avoided.
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            "$PROJECT_DIR/" ./
+          test -s README.md
+          test -s android/settings.gradle.kts
+          test -s android/app/build.gradle.kts
+          test -s backend/research/train_walkforward.py
+          echo "Project source copied; existing repository workflows preserved."
+
+      - name: Commit extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'Extract SPLED INTELLIGENCE source package'
+            git push origin HEAD:main
+          else
+            echo 'Source files already up to date.'
+          fi
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -r backend/requirements.txt \
+            -r backend/research/requirements.txt
+
+      - name: Compile Python and run tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          set -euo pipefail
+          python -m py_compile backend/app/*.py backend/research/*.py
+          python -m pytest -q backend/tests backend/research/tests
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          # Install SDK packages explicitly in the next step.
+          packages: ''
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
+          sdkmanager --list_installed
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Run Android unit tests and build debug APK
+        working-directory: android
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="$RUNNER_TEMP/spled-gradle-build.log"
+          if gradle --no-daemon --stacktrace --warning-mode all testDebugUnitTest assembleDebug 2>&1 | tee "$LOG_FILE"; then
+            echo "ANDROID_BUILD_RESULT=success" >> "$GITHUB_ENV"
+          else
+            result=${PIPESTATUS[0]}
+            echo "ANDROID_BUILD_RESULT=failure" >> "$GITHUB_ENV"
+            echo "========== IMPORTANT GRADLE ERROR LINES =========="
+            grep -n -E '(^e: |error:|What went wrong:|Execution failed for task|Could not resolve|Could not find|Unresolved reference|Compilation error|FAILURE:)' "$LOG_FILE" | tail -n 100 || true
+            echo "========== END IMPORTANT ERROR LINES =========="
+            exit "$result"
+          fi
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPLED-INTELLIGENCE-v0.8.0-debug-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload complete Gradle diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPLED-INTELLIGENCE-gradle-diagnostics
+          path: |
+            ${{ runner.temp }}/spled-gradle-build.log
+            android/app/build/reports/
+            android/app/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
