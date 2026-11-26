@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "model_type": "standardized_logistic_regression_platt",
+  "enabled_for_shadow": false,
+  "features": [],
+  "imputer_medians": [],
+  "scaler_means": [],
+  "scaler_scales": [],
+  "coefficients": [],
+  "intercept": 0.0,
+  "calibration_slope": 1.0,
+  "calibration_intercept": 0.0,
+  "threshold": 0.60,
+  "warning": "No trained model installed. This placeholder intentionally disables AI probabilities. Train and validate using the documented research pipeline before replacing this file."
+}

@@ -1,0 +1,17 @@
+services:
+  api:
+    build: ../backend
+    restart: unless-stopped
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      SIGNAL_DB_PATH: /data/spled_signals.sqlite3
+    volumes:
+      - spled-data:/data
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  spled-data:
