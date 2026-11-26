@@ -98,6 +98,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         running = true
         restoreHistory()
         restoreFiveMinuteForecasts()
+        emitFiveMinuteStats()
         restorePaperTrades()
         emitStatus("DISCOVERING_BINANCE_CONTRACTS")
         scanTask?.cancel(false)
@@ -474,15 +475,6 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     (if (abs(ret5) >= abs(emaGap)) 1 else 0) +
                     (if ((direction == "LONG" && rsiNow in 45.0..70.0) || (direction == "SHORT" && rsiNow in 30.0..55.0)) 1 else 0)).coerceAtMost(9)
                 val stop = if (direction == "LONG") entry * (1.0 - expectedMove / 100.0) else entry * (1.0 + expectedMove / 100.0)
-                val forecast = FiveMinuteForecast(
-                    id = "${m.symbol}:${now}:${direction}", symbol = m.symbol, direction = direction,
-                    entry = entry, target = target, stop = stop, createdAt = now,
-                    createdCandleTime = last.t
-                )
-                synchronized(forecastLock) {
-                    fiveMinuteForecasts.add(0, forecast)
-                    persistFiveMinuteForecastsLocked()
-                }
                 ranked.add(JSONObject().put("symbol", m.symbol).put("direction", direction)
                     .put("entry", entry).put("target", target).put("stop", stop).put("max_price", maxPrice)
                     .put("expected_move_pct", expectedMove).put("max_move_pct", maxMove)
@@ -492,7 +484,25 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             }
             ranked.sortedWith(compareByDescending<JSONObject> { it.optInt("confluence") }
                 .thenByDescending { abs(it.optDouble("return_5m_pct")) })
-                .take(10).forEach { candidates.put(it) }
+                .take(10).forEach { candidate ->
+                    candidates.put(candidate)
+                    val direction = candidate.optString("direction")
+                    val entry = candidate.optDouble("entry")
+                    val target = candidate.optDouble("target")
+                    val stop = candidate.optDouble("stop")
+                    val symbol = candidate.optString("symbol")
+                    val candleTime = candles[symbol]?.let { q -> synchronized(q) { q.lastOrNull()?.t ?: 0L } } ?: 0L
+                    val forecast = FiveMinuteForecast(
+                        id = "$symbol:$now:$direction", symbol = symbol, direction = direction,
+                        entry = entry, target = target, stop = stop, createdAt = now,
+                        createdCandleTime = candleTime
+                    )
+                    synchronized(forecastLock) {
+                        fiveMinuteForecasts.add(0, forecast)
+                        persistFiveMinuteForecastsLocked()
+                    }
+                }
+            emitFiveMinuteStats()
             send("message", JSONObject().put("type", "five_min_scan")
                 .put("status", if (candidates.length() > 0) "READY" else "NO_TRADE")
                 .put("checked", checked).put("skipped", skipped)
