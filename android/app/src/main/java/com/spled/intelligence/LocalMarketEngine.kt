@@ -34,6 +34,13 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         val reasons: List<String>, val created: Long, var status: String = "ACTIVE",
         val aiProbability: Double? = null, val aiStatus: String = "MODEL_NOT_VALIDATED", val createdCandleTime: Long = 0L
     )
+    private data class FiveMinuteForecast(
+        val id: String, val symbol: String, val direction: String,
+        val entry: Double, val target: Double, val stop: Double,
+        val createdAt: Long, val createdCandleTime: Long,
+        var status: String = "PENDING", var exitPrice: Double? = null, var resolvedAt: Long = 0L
+    )
+
     private data class PaperTrade(
         val id: String, val symbol: String, val direction: String, val mode: String,
         val entry: Double, val target: Double, val stop: Double, val quantity: Double,
@@ -62,6 +69,8 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
     private val lastSignalCandle = ConcurrentHashMap<String, Long>()
     private val lastEvaluatedCandle = ConcurrentHashMap<String, Long>()
     private val paperLock = Any()
+    private val forecastLock = Any()
+    private val fiveMinuteForecasts = mutableListOf<FiveMinuteForecast>()
     private val paperTrades = mutableListOf<PaperTrade>()
     private val paperPrefs = context.getSharedPreferences("spled_paper_account", Context.MODE_PRIVATE)
     private val paperInitialBalance = 1000.0
@@ -88,6 +97,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         if (running) return
         running = true
         restoreHistory()
+        restoreFiveMinuteForecasts()
         restorePaperTrades()
         emitStatus("DISCOVERING_BINANCE_CONTRACTS")
         scanTask?.cancel(false)
@@ -270,6 +280,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             q.addLast(candle)
             while (q.size > 300) q.removeFirst()
         }
+        resolveFiveMinuteForecasts(symbol, candle)
         val market = markets[symbol]
         if (market != null) {
             val snapshot = synchronized(q) { q.toList() }
@@ -462,8 +473,18 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     (if (abs(emaGap) >= 0.025) 1 else 0) +
                     (if (abs(ret5) >= abs(emaGap)) 1 else 0) +
                     (if ((direction == "LONG" && rsiNow in 45.0..70.0) || (direction == "SHORT" && rsiNow in 30.0..55.0)) 1 else 0)).coerceAtMost(9)
+                val stop = if (direction == "LONG") entry * (1.0 - expectedMove / 100.0) else entry * (1.0 + expectedMove / 100.0)
+                val forecast = FiveMinuteForecast(
+                    id = "${m.symbol}:${now}:${direction}", symbol = m.symbol, direction = direction,
+                    entry = entry, target = target, stop = stop, createdAt = now,
+                    createdCandleTime = last.t
+                )
+                synchronized(forecastLock) {
+                    fiveMinuteForecasts.add(0, forecast)
+                    persistFiveMinuteForecastsLocked()
+                }
                 ranked.add(JSONObject().put("symbol", m.symbol).put("direction", direction)
-                    .put("entry", entry).put("target", target).put("max_price", maxPrice)
+                    .put("entry", entry).put("target", target).put("stop", stop).put("max_price", maxPrice)
                     .put("expected_move_pct", expectedMove).put("max_move_pct", maxMove)
                     .put("confluence", confluence).put("return_5m_pct", ret5)
                     .put("spread_bps", spreadBps).put("rsi", rsiNow)
@@ -475,8 +496,88 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             send("message", JSONObject().put("type", "five_min_scan")
                 .put("status", if (candidates.length() > 0) "READY" else "NO_TRADE")
                 .put("checked", checked).put("skipped", skipped)
-                .put("scanned_at", now).put("signals", candidates).toString())
+                .put("scanned_at", now).put("signals", candidates)
+                .put("win_rate", fiveMinuteStats().optDouble("win_rate", -1.0))
+                .put("wins", fiveMinuteStats().optInt("wins"))
+                .put("losses", fiveMinuteStats().optInt("losses"))
+                .put("resolved", fiveMinuteStats().optInt("resolved"))
+                .put("pending", fiveMinuteStats().optInt("pending")).toString())
         }.start()
+    }
+
+    private fun resolveFiveMinuteForecasts(symbol: String, candle: Candle) {
+        var changed = false
+        synchronized(forecastLock) {
+            for (forecast in fiveMinuteForecasts) {
+                if (forecast.symbol != symbol || forecast.status != "PENDING" || candle.t <= forecast.createdCandleTime) continue
+                val long = forecast.direction == "LONG"
+                val stopHit = if (long) candle.l <= forecast.stop else candle.h >= forecast.stop
+                val targetHit = if (long) candle.h >= forecast.target else candle.l <= forecast.target
+                val expired = candle.t >= forecast.createdCandleTime + 5L * 60L * 1000L
+                if (stopHit || targetHit || expired) {
+                    val exit = when {
+                        stopHit -> forecast.stop
+                        targetHit -> forecast.target
+                        else -> candle.c
+                    }
+                    val direction = if (long) 1.0 else -1.0
+                    val grossPct = (exit / forecast.entry - 1.0) * direction * 100.0
+                    val estimatedRoundTripCostPct = 2.0 * (paperFeePerSide + paperSlippagePerSide) * 100.0
+                    forecast.exitPrice = exit
+                    forecast.status = if (!stopHit && (targetHit || grossPct > estimatedRoundTripCostPct)) "WIN" else "LOSS"
+                    forecast.resolvedAt = System.currentTimeMillis()
+                    changed = true
+                }
+            }
+            if (changed) persistFiveMinuteForecastsLocked()
+        }
+        if (changed) emitFiveMinuteStats()
+    }
+
+    private fun forecastJson(f: FiveMinuteForecast): JSONObject = JSONObject()
+        .put("id", f.id).put("symbol", f.symbol).put("direction", f.direction)
+        .put("entry", f.entry).put("target", f.target).put("stop", f.stop)
+        .put("created_at", f.createdAt).put("created_candle_time", f.createdCandleTime)
+        .put("status", f.status).put("exit_price", f.exitPrice).put("resolved_at", f.resolvedAt)
+
+    private fun restoreFiveMinuteForecasts() {
+        synchronized(forecastLock) {
+            try {
+                val saved = JSONArray(prefs.getString("five_minute_forecasts", "[]") ?: "[]")
+                for (i in 0 until saved.length()) {
+                    val x = saved.optJSONObject(i) ?: continue
+                    fiveMinuteForecasts.add(FiveMinuteForecast(
+                        id = x.optString("id"), symbol = x.optString("symbol"),
+                        direction = x.optString("direction"), entry = x.optDouble("entry"),
+                        target = x.optDouble("target"), stop = x.optDouble("stop"),
+                        createdAt = x.optLong("created_at"), createdCandleTime = x.optLong("created_candle_time"),
+                        status = x.optString("status", "PENDING"),
+                        exitPrice = if (x.isNull("exit_price")) null else x.optDouble("exit_price"),
+                        resolvedAt = x.optLong("resolved_at")
+                    ))
+                }
+            } catch (_: Exception) { fiveMinuteForecasts.clear() }
+        }
+    }
+
+    private fun persistFiveMinuteForecastsLocked() {
+        val saved = JSONArray()
+        fiveMinuteForecasts.take(1000).forEach { saved.put(forecastJson(it)) }
+        prefs.edit().putString("five_minute_forecasts", saved.toString()).apply()
+    }
+
+    private fun fiveMinuteStats(): JSONObject = synchronized(forecastLock) {
+        val wins = fiveMinuteForecasts.count { it.status == "WIN" }
+        val losses = fiveMinuteForecasts.count { it.status == "LOSS" }
+        val resolved = wins + losses
+        JSONObject().put("wins", wins).put("losses", losses).put("resolved", resolved)
+            .put("pending", fiveMinuteForecasts.count { it.status == "PENDING" })
+            .put("win_rate", if (resolved > 0) wins.toDouble() / resolved * 100.0 else -1.0)
+    }
+
+    private fun emitFiveMinuteStats() {
+        val stats = fiveMinuteStats().put("type", "five_min_stats")
+        send("message", stats.toString())
     }
 
     /** Re-evaluates cached live market state every second; strategy signals remain candle-confirmed. */
