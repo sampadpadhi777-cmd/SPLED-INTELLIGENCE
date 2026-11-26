@@ -498,8 +498,14 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                         createdCandleTime = candleTime
                     )
                     synchronized(forecastLock) {
-                        fiveMinuteForecasts.add(0, forecast)
-                        persistFiveMinuteForecastsLocked()
+                        val alreadyPending = fiveMinuteForecasts.any {
+                            it.symbol == symbol && it.status == "PENDING" && now - it.createdAt < 5L * 60L * 1000L
+                        }
+                        if (!alreadyPending) {
+                            fiveMinuteForecasts.add(0, forecast)
+                            while (fiveMinuteForecasts.size > 1000) fiveMinuteForecasts.removeAt(fiveMinuteForecasts.lastIndex)
+                            persistFiveMinuteForecastsLocked()
+                        }
                     }
                 }
             emitFiveMinuteStats()
