@@ -47,6 +47,12 @@ private data class MarketRow(
     val age: Double?
 )
 
+private data class FiveMinuteSignal(
+    val symbol: String, val direction: String, val entry: Double, val target: Double,
+    val maxPrice: Double, val expectedMovePct: Double, val maxMovePct: Double,
+    val confluence: Int, val return5mPct: Double, val expiresAt: Long
+)
+
 private data class PaperTradeRow(
     val id: String, val symbol: String, val direction: String, val mode: String,
     val entry: Double, val target: Double, val stop: Double, val quantity: Double,
@@ -104,7 +110,7 @@ private fun SpledApp() {
     var scanCycles by remember { mutableStateOf(0L) }
     var evaluatedPairs by remember { mutableIntStateOf(0) }
     var checkedPairs by remember { mutableIntStateOf(0) }
-    var lastScanAt by remember { mutableStateOf(0L) }
+    var lastScanAt by remember { mutableStateOf(0L) }\n    var fiveMinuteSignals by remember { mutableStateOf(emptyList<FiveMinuteSignal>()) }\n    var fiveMinuteStatus by remember { mutableStateOf("Tap Scan to evaluate the next 5 minutes") }\n    var fiveMinuteChecked by remember { mutableIntStateOf(0) }\n    var fiveMinuteScanAt by remember { mutableStateOf(0L) }
 
     val engine = remember(context) {
         LocalMarketEngine(context) { type, value ->
@@ -141,7 +147,7 @@ private fun SpledApp() {
                             checkedPairs = root.optInt("checked_pairs", checkedPairs)
                             lastScanAt = root.optLong("timestamp", lastScanAt)
                         }
-                        "paper_update" -> paper = parsePaperAccount(root)
+                        "five_min_scan" -> {\n                            fiveMinuteStatus = root.optString("status", "NO_TRADE")\n                            fiveMinuteSignals = parseFiveMinuteSignals(root.optJSONArray("signals"))\n                            fiveMinuteChecked = root.optInt("checked", 0)\n                            fiveMinuteScanAt = root.optLong("scanned_at", System.currentTimeMillis())\n                        }\n                        "paper_update" -> paper = parsePaperAccount(root)
                     }
                 }
             }
@@ -193,7 +199,7 @@ private fun SpledApp() {
             }
         ) { padding ->
             when (selectedTab) {
-                0 -> RadarScreen(Modifier.padding(padding), universeCount, markets.size, scannerStatus, modelStatus, signals, scanCycles, evaluatedPairs, checkedPairs, lastScanAt)
+                0 -> RadarScreen(Modifier.padding(padding), universeCount, markets.size, scannerStatus, modelStatus, signals, scanCycles, evaluatedPairs, checkedPairs, lastScanAt, fiveMinuteSignals, fiveMinuteStatus, fiveMinuteChecked, fiveMinuteScanAt, { engine.requestFiveMinuteScan() })
                 1 -> MarketsScreen(Modifier.padding(padding), markets, search, { search = it })
                 2 -> PaperScreen(Modifier.padding(padding), paper)
                 3 -> JournalScreen(Modifier.padding(padding), history)
@@ -236,6 +242,14 @@ private fun RadarScreen(
                     Spacer(Modifier.height(12.dp))
                     Text("Scanner: ${humanStatus(status)} · Checked $checkedPairs live pairs · $evaluatedPairs new 1m candle setups", color = if (status.startsWith("LIVE")) Mint else Amber, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
                     Text(if (lastScanAt > 0) "Last scan: ${java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(java.util.Date(lastScanAt))}" else "Waiting for first scan cycle", color = Muted, fontSize = 9.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = onFiveMinuteScan, modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Mint, contentColor = Bg),
+                        shape = RoundedCornerShape(12.dp)) {
+                        Text("SCAN NEXT 5 MINUTES", fontWeight = FontWeight.Black, letterSpacing = .8.sp)
+                    }
+                    Text("One-shot scan · fresh quotes + closed 1m candles · all eligible USDT pairs", color = Muted, fontSize = 9.sp)
+
                 }
             }
         }
@@ -254,7 +268,37 @@ private fun RadarScreen(
             items(active, key = { it.symbol }) { SignalCard(it, active.indexOf(it) + 1) }
         }
         item {
-            Text("Rule score is NOT a win probability. No trained model is installed; validate signals in paper mode before risking capital.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("NEXT 5-MINUTE OUTLOOK", color = White, fontSize = 14.sp, fontWeight = FontWeight.Black, modifier = Modifier.weight(1f))
+                    Text(if (fiveMinuteScanAt > 0) "CHECKED $fiveMinuteChecked" else "ON DEMAND", color = Mint, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                }
+                Text(fiveMinuteStatus.replace('_', ' '), color = if (fiveMinuteSignals.isEmpty()) Amber else Muted, fontSize = 10.sp)
+                if (fiveMinuteSignals.isEmpty()) {
+                    EmptyPanel("No confirmed directional setup", "Tap Scan after live data is ready. Weak or conflicting direction is filtered as NO TRADE.")
+                } else {
+                    fiveMinuteSignals.forEachIndexed { index, s ->
+                        Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(14.dp)) {
+                            Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("#${index + 1}  ${s.symbol}", color = White, fontWeight = FontWeight.Black, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                    Text(s.direction, color = if (s.direction == "LONG") Mint else Red, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                                }
+                                Text("${if (s.direction == "LONG") "+" else "-"}%.2f%% expected · max estimate %.2f%%".format(Locale.US, s.expectedMovePct, s.maxMovePct), color = if (s.direction == "LONG") Mint else Red, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    PriceTile("ENTRY", s.entry, Modifier.weight(1f), White)
+                                    PriceTile("TARGET", s.target, Modifier.weight(1f), Mint)
+                                    PriceTile("MAX EST.", s.maxPrice, Modifier.weight(1f), Amber)
+                                }
+                                Text("5m momentum ${"%+.3f".format(Locale.US, s.return5mPct)}% · Confluence ${s.confluence}/9 · 5m horizon", color = Muted, fontSize = 9.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+\n            Text("Rule score is NOT a win probability. No trained model is installed; validate signals in paper mode before risking capital.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
         }
     }
 }
@@ -494,6 +538,15 @@ private fun parseMarkets(array: JSONArray?): List<MarketRow> {
     if (array == null) return emptyList()
     return (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { x ->
         MarketRow(x.optString("symbol"), x.doubleOrNull("price"), x.doubleOrNull("change_24h_pct"), x.doubleOrNull("quote_volume_24h"), x.doubleOrNull("spread_bps"), x.doubleOrNull("data_age_seconds"))
+    } }
+}
+
+private fun parseFiveMinuteSignals(array: JSONArray?): List<FiveMinuteSignal> {
+    if (array == null) return emptyList()
+    return (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { x ->
+        FiveMinuteSignal(x.optString("symbol"), x.optString("direction"), x.optDouble("entry"),
+            x.optDouble("target"), x.optDouble("max_price"), x.optDouble("expected_move_pct"),
+            x.optDouble("max_move_pct"), x.optInt("confluence"), x.optDouble("return_5m_pct"), x.optLong("expires_at"))
     } }
 }
 
