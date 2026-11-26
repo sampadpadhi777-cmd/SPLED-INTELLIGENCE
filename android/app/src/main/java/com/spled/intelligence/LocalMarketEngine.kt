@@ -540,7 +540,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     val grossPct = (exit / forecast.entry - 1.0) * direction * 100.0
                     val estimatedRoundTripCostPct = 2.0 * (paperFeePerSide + paperSlippagePerSide) * 100.0
                     forecast.exitPrice = exit
-                    forecast.status = if (!stopHit && (targetHit || grossPct > estimatedRoundTripCostPct)) "WIN" else "LOSS"
+                    forecast.status = if (!stopHit && grossPct > estimatedRoundTripCostPct) "WIN" else "LOSS"
                     forecast.resolvedAt = System.currentTimeMillis()
                     changed = true
                 }
