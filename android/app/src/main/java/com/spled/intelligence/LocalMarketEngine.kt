@@ -480,7 +480,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     .put("expected_move_pct", expectedMove).put("max_move_pct", maxMove)
                     .put("confluence", confluence).put("return_5m_pct", ret5)
                     .put("spread_bps", spreadBps).put("rsi", rsiNow)
-                    .put("created_at", now).put("expires_at", now + 5 * 60 * 1000L))
+                    .put("created_at", now).put("candle_time", last.t).put("expires_at", now + 5 * 60 * 1000L))
             }
             ranked.sortedWith(compareByDescending<JSONObject> { it.optInt("confluence") }
                 .thenByDescending { abs(it.optDouble("return_5m_pct")) })
@@ -491,7 +491,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     val target = candidate.optDouble("target")
                     val stop = candidate.optDouble("stop")
                     val symbol = candidate.optString("symbol")
-                    val candleTime = candles[symbol]?.let { q -> synchronized(q) { q.lastOrNull()?.t ?: 0L } } ?: 0L
+                    val candleTime = candidate.optLong("candle_time")
                     val forecast = FiveMinuteForecast(
                         id = "$symbol:$now:$direction", symbol = symbol, direction = direction,
                         entry = entry, target = target, stop = stop, createdAt = now,
@@ -523,7 +523,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                 val long = forecast.direction == "LONG"
                 val stopHit = if (long) candle.l <= forecast.stop else candle.h >= forecast.stop
                 val targetHit = if (long) candle.h >= forecast.target else candle.l <= forecast.target
-                val expired = candle.t >= forecast.createdCandleTime + 5L * 60L * 1000L
+                val expired = candle.t + 60_000L >= forecast.createdAt + 5L * 60L * 1000L
                 if (stopHit || targetHit || expired) {
                     val exit = when {
                         stopHit -> forecast.stop
