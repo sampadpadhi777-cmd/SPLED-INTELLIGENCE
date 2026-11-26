@@ -268,7 +268,6 @@ private fun RadarScreen(
             items(active, key = { it.symbol }) { SignalCard(it, active.indexOf(it) + 1) }
         }
         item {
-        item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("NEXT 5-MINUTE OUTLOOK", color = White, fontSize = 14.sp, fontWeight = FontWeight.Black, modifier = Modifier.weight(1f))
