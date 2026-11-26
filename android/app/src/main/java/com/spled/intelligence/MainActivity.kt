@@ -110,7 +110,16 @@ private fun SpledApp() {
     var scanCycles by remember { mutableStateOf(0L) }
     var evaluatedPairs by remember { mutableIntStateOf(0) }
     var checkedPairs by remember { mutableIntStateOf(0) }
-    var lastScanAt by remember { mutableStateOf(0L) }\n    var fiveMinuteSignals by remember { mutableStateOf(emptyList<FiveMinuteSignal>()) }\n    var fiveMinuteStatus by remember { mutableStateOf("Tap Scan to evaluate the next 5 minutes") }\n    var fiveMinuteChecked by remember { mutableIntStateOf(0) }\n    var fiveMinuteScanAt by remember { mutableStateOf(0L) }
+    var lastScanAt by remember { mutableStateOf(0L) }
+    var fiveMinuteWinRate by remember { mutableStateOf<Double?>(null) }
+    var fiveMinuteWins by remember { mutableIntStateOf(0) }
+    var fiveMinuteLosses by remember { mutableIntStateOf(0) }
+    var fiveMinuteResolved by remember { mutableIntStateOf(0) }
+    var fiveMinutePending by remember { mutableIntStateOf(0) }
+    var fiveMinuteSignals by remember { mutableStateOf(emptyList<FiveMinuteSignal>()) }
+    var fiveMinuteStatus by remember { mutableStateOf("Tap Scan to evaluate the next 5 minutes") }
+    var fiveMinuteChecked by remember { mutableIntStateOf(0) }
+    var fiveMinuteScanAt by remember { mutableStateOf(0L) }
 
     val engine = remember(context) {
         LocalMarketEngine(context) { type, value ->
@@ -147,7 +156,18 @@ private fun SpledApp() {
                             checkedPairs = root.optInt("checked_pairs", checkedPairs)
                             lastScanAt = root.optLong("timestamp", lastScanAt)
                         }
-                        "five_min_scan" -> {\n                            fiveMinuteStatus = root.optString("status", "NO_TRADE")\n                            fiveMinuteSignals = parseFiveMinuteSignals(root.optJSONArray("signals"))\n                            fiveMinuteChecked = root.optInt("checked", 0)\n                            fiveMinuteScanAt = root.optLong("scanned_at", System.currentTimeMillis())\n                        }\n                        "paper_update" -> paper = parsePaperAccount(root)
+                        "five_min_scan", "five_min_stats" -> {
+                            if (root.has("status")) fiveMinuteStatus = root.optString("status", "NO_TRADE")
+                            if (root.has("signals")) fiveMinuteSignals = parseFiveMinuteSignals(root.optJSONArray("signals"))
+                            fiveMinuteChecked = root.optInt("checked", fiveMinuteChecked)
+                            fiveMinuteScanAt = root.optLong("scanned_at", fiveMinuteScanAt)
+                            fiveMinuteWinRate = root.optDouble("win_rate", -1.0).takeIf { it >= 0.0 }
+                            fiveMinuteWins = root.optInt("wins", fiveMinuteWins)
+                            fiveMinuteLosses = root.optInt("losses", fiveMinuteLosses)
+                            fiveMinuteResolved = root.optInt("resolved", fiveMinuteResolved)
+                            fiveMinutePending = root.optInt("pending", fiveMinutePending)
+                        }
+                        "paper_update" -> paper = parsePaperAccount(root)
                     }
                 }
             }
@@ -199,7 +219,7 @@ private fun SpledApp() {
             }
         ) { padding ->
             when (selectedTab) {
-                0 -> RadarScreen(Modifier.padding(padding), universeCount, markets.size, scannerStatus, modelStatus, signals, scanCycles, evaluatedPairs, checkedPairs, lastScanAt, fiveMinuteSignals, fiveMinuteStatus, fiveMinuteChecked, fiveMinuteScanAt, { engine.requestFiveMinuteScan() })
+                0 -> RadarScreen(Modifier.padding(padding), universeCount, markets.size, scannerStatus, modelStatus, signals, scanCycles, evaluatedPairs, checkedPairs, lastScanAt, fiveMinuteSignals, fiveMinuteStatus, fiveMinuteChecked, fiveMinuteScanAt, fiveMinuteWinRate, fiveMinuteWins, fiveMinuteLosses, fiveMinuteResolved, fiveMinutePending, { engine.requestFiveMinuteScan() })
                 1 -> MarketsScreen(Modifier.padding(padding), markets, search, { search = it })
                 2 -> PaperScreen(Modifier.padding(padding), paper)
                 3 -> JournalScreen(Modifier.padding(padding), history)
@@ -212,7 +232,10 @@ private fun SpledApp() {
 @Composable
 private fun RadarScreen(
     modifier: Modifier, universeCount: Int, marketCount: Int, status: String,
-    modelStatus: String, allSignals: List<Opportunity>, scanCycles: Long, evaluatedPairs: Int, checkedPairs: Int, lastScanAt: Long
+    modelStatus: String, allSignals: List<Opportunity>, scanCycles: Long, evaluatedPairs: Int, checkedPairs: Int, lastScanAt: Long,
+    fiveMinuteSignals: List<FiveMinuteSignal>, fiveMinuteStatus: String, fiveMinuteChecked: Int, fiveMinuteScanAt: Long,
+    fiveMinuteWinRate: Double?, fiveMinuteWins: Int, fiveMinuteLosses: Int, fiveMinuteResolved: Int, fiveMinutePending: Int,
+    onFiveMinuteScan: () -> Unit
 ) {
     val active = allSignals.filter { it.status == "ACTIVE" }
         .groupBy { it.symbol }
@@ -274,6 +297,18 @@ private fun RadarScreen(
                     Text(if (fiveMinuteScanAt > 0) "CHECKED $fiveMinuteChecked" else "ON DEMAND", color = Mint, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                 }
                 Text(fiveMinuteStatus.replace('_', ' '), color = if (fiveMinuteSignals.isEmpty()) Amber else Muted, fontSize = 10.sp)
+                Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(14.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(13.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text("ACTUAL 5-MINUTE WIN RATE", color = Muted, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                        Text(fiveMinuteWinRate?.let { "%.1f%%".format(Locale.US, it) } ?: "COLLECTING RESULTS",
+                            color = if ((fiveMinuteWinRate ?: 0.0) >= 50.0) Mint else Amber,
+                            fontSize = 24.sp, fontWeight = FontWeight.Black)
+                        Text("$fiveMinuteWins wins · $fiveMinuteLosses losses · $fiveMinuteResolved resolved · $fiveMinutePending pending",
+                            color = Muted, fontSize = 10.sp)
+                        Text("Win rate = wins ÷ (wins + losses). Costs included; pending signals excluded.",
+                            color = Muted, fontSize = 9.sp)
+                    }
+                }
                 if (fiveMinuteSignals.isEmpty()) {
                     EmptyPanel("No confirmed directional setup", "Tap Scan after live data is ready. Weak or conflicting direction is filtered as NO TRADE.")
                 } else {
@@ -290,14 +325,14 @@ private fun RadarScreen(
                                     PriceTile("TARGET", s.target, Modifier.weight(1f), Mint)
                                     PriceTile("MAX EST.", s.maxPrice, Modifier.weight(1f), Amber)
                                 }
-                                Text("5m momentum ${"%+.3f".format(Locale.US, s.return5mPct)}% · Confluence ${s.confluence}/9 · 5m horizon", color = Muted, fontSize = 9.sp)
+                                Text("5m momentum ${"%+.3f".format(Locale.US, s.return5mPct)}% · forecast horizon 5 min", color = Muted, fontSize = 9.sp)
                             }
                         }
                     }
                 }
             }
         }
-            Text("Confluence is rule agreement, NOT a win rate. No trained five-minute model is validated; paper-test signals before trading.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
+            Text("Historical five-minute hit rate is based on this device's resolved paper forecasts, not a guarantee of future results.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
         }
     }
 }
