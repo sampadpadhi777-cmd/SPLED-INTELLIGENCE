@@ -332,7 +332,9 @@ private fun RadarScreen(
                 }
             }
         }
+        item {
             Text("Historical five-minute hit rate is based on this device's resolved paper forecasts, not a guarantee of future results.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
+        }
         }
     }
 }
