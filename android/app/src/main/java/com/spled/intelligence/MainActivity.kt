@@ -297,7 +297,7 @@ private fun RadarScreen(
                 }
             }
         }
-\n            Text("Rule score is NOT a win probability. No trained model is installed; validate signals in paper mode before risking capital.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
+            Text("Confluence is rule agreement, NOT a win rate. No trained five-minute model is validated; paper-test signals before trading.", color = Amber, fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().background(Color(0x1AFFC46B), RoundedCornerShape(10.dp)).padding(11.dp))
         }
     }
 }
