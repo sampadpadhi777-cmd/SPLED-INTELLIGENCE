@@ -54,9 +54,11 @@ jobs:
           test -s "$PROJECT/README.md"
           test -s "$PROJECT/BUILD_STATUS.md"
           test -s "$PROJECT/android/settings.gradle.kts"
+          test -s "$PROJECT/android/build.gradle.kts"
           test -s "$PROJECT/android/app/build.gradle.kts"
           test -s "$PROJECT/android/app/src/main/AndroidManifest.xml"
           test -s "$PROJECT/backend/requirements.txt"
+          test -s "$PROJECT/backend/research/requirements.txt"
           test -s "$PROJECT/backend/research/train_walkforward.py"
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
           echo "Source structure verified."
@@ -65,10 +67,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rsync -a --exclude='.git' "$PROJECT_DIR/" ./
+          # Do not copy the ZIP's nested .github workflows. The current workflow
+          # is already running; pushing another workflow file requires a separate
+          # workflows permission and is intentionally avoided.
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            "$PROJECT_DIR/" ./
+          test -s README.md
           test -s android/settings.gradle.kts
           test -s android/app/build.gradle.kts
           test -s backend/research/train_walkforward.py
+          echo "Project source copied; existing repository workflows preserved."
 
       - name: Commit extracted source
         shell: bash
@@ -92,12 +102,15 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r backend/requirements.txt -r backend/research/requirements.txt
+          python -m pip install \
+            -r backend/requirements.txt \
+            -r backend/research/requirements.txt
 
       - name: Compile Python and run tests
         env:
           PYTHONPATH: backend
         run: |
+          set -euo pipefail
           python -m py_compile backend/app/*.py backend/research/*.py
           python -m pytest -q backend/tests backend/research/tests
 
@@ -112,7 +125,10 @@ jobs:
 
       - name: Install Android SDK packages
         run: |
-          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools'
+          sdkmanager --install \
+            'platforms;android-35' \
+            'build-tools;35.0.0' \
+            'platform-tools'
 
       - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
