@@ -1,1 +1,35 @@
+name: Extract SPLED source ZIP
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source archive
+        run: |
+          set -euo pipefail
+          ARCHIVE="SPLED_INTELLIGENCE_v0.8.0_HYBRID_AI_SOURCE.zip"
+          test -s "$ARCHIVE"
+          unzip -t "$ARCHIVE"
+          mkdir -p /tmp/spled-source
+          unzip -q "$ARCHIVE" -d /tmp/spled-source
+          test -d /tmp/spled-source/SPLED_INTELLIGENCE
+          rsync -a /tmp/spled-source/SPLED_INTELLIGENCE/ ./
+
+      - name: Commit extracted source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Extract SPLED INTELLIGENCE v0.8.0 source"
+            git push
+          fi
