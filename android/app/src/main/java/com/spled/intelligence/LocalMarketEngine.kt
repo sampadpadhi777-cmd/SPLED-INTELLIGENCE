@@ -415,6 +415,70 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         }
     }
 
+    /** One-shot directional scan using the latest closed 1m candles and fresh live quotes. */
+    fun requestFiveMinuteScan() {
+        if (!running) {
+            send("message", JSONObject().put("type", "five_min_scan")
+                .put("status", "NOT_READY").put("message", "Scanner is not running").toString())
+            return
+        }
+        Thread {
+            val now = System.currentTimeMillis()
+            val candidates = JSONArray()
+            var checked = 0
+            var skipped = 0
+            val ranked = mutableListOf<JSONObject>()
+            for (m in markets.values) {
+                val q = candles[m.symbol]
+                if (q == null || now - m.received > 10_000L) { skipped++; continue }
+                val c = synchronized(q) { q.toList() }
+                if (c.size < 30) { skipped++; continue }
+                val last = c.last()
+                val base = c[c.size - 6].c
+                val bid = m.bid
+                val ask = m.ask
+                val mid = m.price ?: last.c
+                if (base <= 0.0 || mid <= 0.0 || bid == null || ask == null || ask < bid) { skipped++; continue }
+                checked++
+                val closes = c.map { it.c }
+                val emaFast = ema(closes.takeLast(20), 9)
+                val emaSlow = ema(closes.takeLast(30), 21)
+                val ret5 = (last.c / base - 1.0) * 100.0
+                val emaGap = (emaFast / emaSlow - 1.0) * 100.0
+                val rsiNow = rsi(closes) ?: 50.0
+                val spreadBps = m.spread ?: Double.POSITIVE_INFINITY
+                val volume = m.volume ?: 0.0
+                if (spreadBps > 15.0 || volume < 1_000_000.0) { skipped++; continue }
+                val aligned = (ret5 > 0 && emaGap > 0) || (ret5 < 0 && emaGap < 0)
+                if (!aligned || abs(ret5) < 0.025 || (ret5 > 0 && rsiNow > 78) || (ret5 < 0 && rsiNow < 22)) continue
+                val direction = if (ret5 > 0) "LONG" else "SHORT"
+                val rawMove = abs(ret5) * 0.55 + abs(emaGap) * 0.45
+                val expectedMove = rawMove.coerceIn(0.05, 0.70)
+                val entry = if (direction == "LONG") ask else bid
+                val target = if (direction == "LONG") entry * (1.0 + expectedMove / 100.0) else entry * (1.0 - expectedMove / 100.0)
+                val maxMove = (expectedMove * 1.20).coerceAtMost(0.70)
+                val maxPrice = if (direction == "LONG") entry * (1.0 + maxMove / 100.0) else entry * (1.0 - maxMove / 100.0)
+                val confluence = (5 + (if (abs(ret5) >= 0.10) 1 else 0) +
+                    (if (abs(emaGap) >= 0.025) 1 else 0) +
+                    (if (abs(ret5) >= abs(emaGap)) 1 else 0) +
+                    (if ((direction == "LONG" && rsiNow in 45.0..70.0) || (direction == "SHORT" && rsiNow in 30.0..55.0)) 1 else 0)).coerceAtMost(9)
+                ranked.add(JSONObject().put("symbol", m.symbol).put("direction", direction)
+                    .put("entry", entry).put("target", target).put("max_price", maxPrice)
+                    .put("expected_move_pct", expectedMove).put("max_move_pct", maxMove)
+                    .put("confluence", confluence).put("return_5m_pct", ret5)
+                    .put("spread_bps", spreadBps).put("rsi", rsiNow)
+                    .put("created_at", now).put("expires_at", now + 5 * 60 * 1000L))
+            }
+            ranked.sortedWith(compareByDescending<JSONObject> { it.optInt("confluence") }
+                .thenByDescending { abs(it.optDouble("return_5m_pct")) })
+                .take(10).forEach { candidates.put(it) }
+            send("message", JSONObject().put("type", "five_min_scan")
+                .put("status", if (candidates.length() > 0) "READY" else "NO_TRADE")
+                .put("checked", checked).put("skipped", skipped)
+                .put("scanned_at", now).put("signals", candidates).toString())
+        }.start()
+    }
+
     /** Re-evaluates cached live market state every second; strategy signals remain candle-confirmed. */
     private fun runOneSecondScan() {
         if (!running) return
