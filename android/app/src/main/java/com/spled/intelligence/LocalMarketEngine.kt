@@ -126,10 +126,11 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     emitStatus("DISCOVERED_${symbols.size}_USDT_PERPETUALS")
                     connect("ticker", "$ws/ws/!ticker@arr")
                     connect("book", "$ws/ws/!bookTicker")
+                    // Start live candle streams immediately; REST warm-up must not block them.
+                    if (running) subscribeKlines(symbols)
                     Thread {
                         warmup(symbols)
-                        if (running) subscribeKlines(symbols)
-                        emitSnapshot()
+                        if (running) emitSnapshot()
                     }.start()
                     Thread { refreshUniverseLoop() }.start()
                 }
@@ -179,28 +180,43 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
     }
 
     private fun warmup(symbols: List<String>) {
-        // Gentle sequential warm-up: 80 x 1m candles per contract. Public REST only.
-        for (symbol in symbols) {
-            if (!running) return
-            try {
-                val url = "$rest/fapi/v1/klines?symbol=$symbol&interval=1m&limit=80"
-                val req = Request.Builder().url(url).build()
-                client.newCall(req).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val a = JSONArray(response.body?.string() ?: "[]")
-                        val q = ArrayDeque<Candle>()
-                        for (i in 0 until max(0, a.length() - 1)) {
-                            val row = a.optJSONArray(i) ?: continue
-                            if (row.length() < 6) continue
-                            q.add(Candle(row.optLong(0), row.optString(1).toDoubleOrNull() ?: 0.0,
-                                row.optString(2).toDoubleOrNull() ?: 0.0, row.optString(3).toDoubleOrNull() ?: 0.0,
-                                row.optString(4).toDoubleOrNull() ?: 0.0, row.optString(5).toDoubleOrNull() ?: 0.0))
+        // Bounded parallel warm-up: avoid hundreds of sequential HTTP calls delaying candle readiness.
+        val pool = Executors.newFixedThreadPool(8)
+        try {
+            val jobs = symbols.map { symbol ->
+                pool.submit {
+                    if (!running) return@submit
+                    try {
+                        val url = "$rest/fapi/v1/klines?symbol=$symbol&interval=1m&limit=80"
+                        val req = Request.Builder().url(url).build()
+                        client.newCall(req).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val a = JSONArray(response.body?.string() ?: "[]")
+                                val q = ArrayDeque<Candle>()
+                                for (i in 0 until max(0, a.length() - 1)) {
+                                    val row = a.optJSONArray(i) ?: continue
+                                    if (row.length() < 6) continue
+                                    q.add(Candle(row.optLong(0), row.optString(1).toDoubleOrNull() ?: 0.0,
+                                        row.optString(2).toDoubleOrNull() ?: 0.0, row.optString(3).toDoubleOrNull() ?: 0.0,
+                                        row.optString(4).toDoubleOrNull() ?: 0.0, row.optString(5).toDoubleOrNull() ?: 0.0))
+                                }
+                                if (q.isNotEmpty()) {
+                                    val live = candles[symbol]
+                                    if (live == null) candles[symbol] = q
+                                    else synchronized(live) {
+                                        val merged = (q.toList() + live.toList()).distinctBy { it.t }.sortedBy { it.t }.takeLast(300)
+                                        live.clear()
+                                        live.addAll(merged)
+                                    }
+                                }
+                            }
                         }
-                        if (q.isNotEmpty()) candles[symbol] = q
-                    }
+                    } catch (_: Exception) { /* live kline stream can still populate this symbol */ }
                 }
-            } catch (_: Exception) { /* symbol will become ready after enough live candles */ }
-            try { Thread.sleep(120) } catch (_: InterruptedException) { return }
+            }
+            jobs.forEach { try { it.get() } catch (_: Exception) { } }
+        } finally {
+            pool.shutdownNow()
         }
     }
 
