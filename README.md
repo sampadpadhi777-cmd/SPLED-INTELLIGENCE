@@ -1,39 +1,46 @@
-# SPLED INTELLIGENCE 0.8.0
+# SPLED INTELLIGENCE 1.0.0 — One-Second Radar + Paper Trading
 
-**Hybrid AI research and manual-trading assistant for Binance USDⓈ-M Futures.** Android scanner is phone-local; Python handles historical research/training. The app only produces analysis and manual trade plans. It never places orders.
+**Android-first Binance USDⓈ-M Futures market-intelligence scanner.** It reads public market data, ranks candidate setups and produces manual trade plans. It never places exchange orders.
 
-## What is in this build
-- Public Binance Futures market-data scanner for eligible USDT perpetual contracts.
-- Seven strategy candidate families and market-structure references.
-- Independent risk gate with spread/freshness/liquidity checks and estimated fee/slippage-adjusted reward/risk.
-- Local signal journal with conservative closed-candle target/stop resolution.
-- Seven-strategy historical label generator, purged chronological model training, calibration, holdout metrics and portable Android model export.
-- Kotlin on-device inference for a calibrated Logistic Regression model. The checked-in model asset is intentionally disabled until genuine historical research passes the screening gate.
+## What this build actually does
 
-## Important truth
-This ZIP is a **source package**, not a verified APK or a proven profitable strategy. No real historical model was trained during packaging. The current model asset is disabled and the app must show no AI probability. A successful historical screening gate only enables a shadow estimate; it does not approve real-money use.
+- Discovers eligible `TRADING` USDⓈ-M `PERPETUAL` contracts with `USDT` as quote asset from Binance `exchangeInfo` at runtime. The count is dynamic; it is not hard-coded to 500.
+- Reads Binance public 24-hour ticker and best-bid/ask streams, plus sharded closed 1-minute kline streams (80 symbols per stream connection).
+- Warms up candle history and evaluates seven rule-based candidate families: breakout, EMA pullback, momentum expansion, Bollinger mean reversion, VWAP reclaim, MACD cross and range expansion.
+- Applies spread, liquidity, feed freshness, structural stop distance, gross R:R and estimated net R:R filters.
+- Prefers the nearest visible swing obstacle as target when it provides enough room; otherwise uses a 0.7% reference target or a minimum 1.6R target distance.
+- Places a structural invalidation stop beyond recent swing structure with an ATR buffer. It does not widen stops to wait for a hoped-for recovery.
+- Shows the top 10 distinct symbols by rule score after risk filters, with entry reference, target, stop, R:R and rationale.
+- Stores the latest signal journal locally and resolves target/stop on subsequent closed candles. If target and stop are both touched in one candle, the conservative rule counts the stop first.
+- Uses a custom dark UI and SPLED mark, with Radar, Markets, Paper, Journal and System screens.
+- Runs a one-second local scan cycle across fresh cached markets, updates the dashboard and monitors paper positions. Strategy decisions are recalculated on completed 1-minute candles to avoid duplicate signals and excessive phone CPU use.
+- Automatically opens virtual paper positions when eligible ideas pass the existing scanner and risk filters. The paper account starts with 1,000 virtual USDT, uses 1x notional, caps at five positions, sizes to 0.5% equity risk and 20% equity notional per position, and records assumed fees/slippage. Positions exit at stop, target or four-hour time limit.
 
-## Build APK
-Open `android/` in Android Studio or run `gradle assembleDebug` with JDK 17, Android SDK 35 and Gradle 8.10.2. GitHub Actions workflow `.github/workflows/android-build.yml` runs tests then attempts the debug APK build. Download the APK only after the workflow reports success.
+## Critical limitations
 
-## Train and export a model
-See `backend/research/README.md`. Short version:
+- **This is a rule-based decision-support build, not a trained AI product.** The checked-in model asset is intentionally disabled. A score such as 82 points is a rule rank, not an 82% win probability.
+- No verified win rate or profitability claim is made. Historical training code is research tooling; a genuine trained model must pass chronological out-of-sample validation and forward shadow testing before it is enabled.
+- The scanner reads 1-minute candles. It does not claim a fully verified multi-timeframe 15m/1h/4h signal model.
+- Public data and WebSocket delivery can be delayed or disconnected. A live-looking UI is not an execution guarantee.
+- Phone-local scanning runs only while Android keeps the app process alive and internet is available. Force-stop, process death, battery restrictions, phone shutdown or network loss pauses scanning.
+- The stop is a pre-defined structural invalidation level, not a probability that price will recover. Never widen it after entry to avoid realizing a loss.
+- Estimated costs use the risk engine assumptions: 0.05% fee per side plus 0.10% round-trip slippage. Replace these with actual account costs before relying on net R:R. Funding is not currently included in the Android estimate.
+- Manual execution only. No exchange API key, order placement, order modification or cancellation.
 
-```bash
-cd backend
-pip install -r research/requirements.txt
-python research/download_binance_history.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --days 180 --out research/data_1m.csv
-python research/label_dataset.py --csv research/data_1m.csv --out research/candidates.csv --horizon 240 --fee-side 0.0005 --slippage-round-trip 0.001
-python research/train_walkforward.py --csv research/candidates.csv --out research/artifacts/target_first.joblib --min-oos 200 --android-out ../android/app/src/main/assets/hybrid_model.json
-```
+## Build
 
-If the historical gate fails, the exported Android artifact stays disabled. Rebuild the APK after exporting a passing shadow artifact. Review the metrics and test feature parity first.
+Use JDK 17, Android SDK 35 and Gradle 8.10.2. The GitHub Actions workflow in the repository runs Python tests, Android unit tests and assembles a debug APK. Download the APK only after a successful workflow and install it on a test device first.
 
-## Operating limits
-- Phone-local scanner runs only while Android keeps the app process alive and internet is available.
-- No paid hosting, AI API, or exchange API key is required.
-- No automatic trading, leverage changes, or order placement.
-- Costs in the app are assumptions (0.05% fee per side + 0.10% round-trip slippage) and must be replaced with the actual account's costs before relying on net R:R.
-- No win-rate or profit guarantee. Forward shadow validation and device tests are mandatory.
+## Real-money release gates
 
-See `BUILD_STATUS.md`, `docs/RELEASE_GATES.md`, and `docs/FREE_LOCAL_MODE.md`.
+1. Android compilation and physical-device installation pass.
+2. Live Binance stream stability, reconnection, universe count and rate-limit behaviour are observed on the actual phone.
+3. Historical walk-forward testing includes fees, slippage, funding, conservative candle ambiguity and multiple market regimes.
+4. Forward shadow testing records at least 200 resolved signals over at least 30 calendar days, extending the period if the sample is insufficient.
+5. Positive net expectancy, acceptable drawdown and reliable calibration are demonstrated out of sample.
+
+Until those gates pass, use paper/shadow mode only. Paper fills are approximations and do not include funding, liquidation, partial fills or queue position. No system can guarantee a winning trade.
+
+
+## 1.0.0 Paper Trading
+The Android app starts the phone-local scanner when opened. A one-second scan cycle checks cached live market data and updates the dashboard; strategy decisions remain confirmed on completed 1-minute candles. A local simulated paper account automatically records eligible signals with virtual position sizing, assumed fees/slippage, target/stop/time exits, and persistent history. It never submits exchange orders. See `docs/PAPER_TRADING_AND_REFRESH.md` for assumptions and limitations.

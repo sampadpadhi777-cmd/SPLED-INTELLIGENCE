@@ -1,15 +1,20 @@
 # Changelog
 
-## 0.8.0 — Hybrid AI source integration
-- Added portable calibrated Logistic Regression artifact export from chronological research training.
-- Added dependency-free Kotlin on-device inference; model asset intentionally disabled until genuine history passes the historical screening gate.
-- Expanded research label generator to seven strategy families with structural swing stops, next-candle-open entry, opening-gap fills and conservative same-candle stop-first handling.
-- Added independent Android risk gate for stale feed, spread, quote volume, stop distance, gross R:R and estimated cost-adjusted net R:R.
-- Improved closed-candle signal lifecycle and persistence; no same-candle outcome look-ahead.
-- Added free Google Colab notebook for training from an Android phone.
-- Added Android unit tests for risk gates and CI workflow that runs Python tests and Android unit tests before APK assembly.
-- Explicitly retained paper/shadow-only status; no model was trained from real data in this packaging session.
+## 0.9.0
+- Connected the Android Compose UI directly to the phone-local Binance scanner.
+- Added redesigned SPLED branding and Radar / Markets / Journal / System screens.
+- Added top-10 distinct symbol ranking after independent risk checks.
+- Improved target selection using visible swing structure with 0.7% reference and 1.6R minimum.
+- Explicitly labels rule score as a rank, not AI win probability.
+- Added release limitations and paper-testing requirements.
+- Standardized Java and Kotlin JVM targets to 17.
 
-## 0.7.0 — Research hardening
-- Added public Binance historical downloader, target-before-stop labels and purged chronological training pipeline.
-- Added research status and release gates.
+## 0.8.1
+- Fixed Java/Kotlin JVM target mismatch by setting both compile targets to Java 17.
+
+
+## 1.0.0 — Local one-second radar + paper trading
+- Added automatic virtual trade simulation and persistent local paper journal.
+- Added 1-second scan heartbeat, live pair checks and paper position monitoring.
+- Kept signal logic candle-confirmed on completed 1-minute candles.
+- Added Paper tab and virtual account metrics.

@@ -9,6 +9,8 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -32,6 +34,12 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         val reasons: List<String>, val created: Long, var status: String = "ACTIVE",
         val aiProbability: Double? = null, val aiStatus: String = "MODEL_NOT_VALIDATED", val createdCandleTime: Long = 0L
     )
+    private data class PaperTrade(
+        val id: String, val symbol: String, val direction: String, val mode: String,
+        val entry: Double, val target: Double, val stop: Double, val quantity: Double,
+        val riskUsd: Double, val openedAt: Long, var status: String = "OPEN",
+        var exitPrice: Double? = null, var netPnl: Double? = null, var closedAt: Long? = null
+    )
 
     private val main = Handler(Looper.getMainLooper())
     private val client = OkHttpClient.Builder()
@@ -48,6 +56,20 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
     private val prefs = context.getSharedPreferences("spled_local_scanner", Context.MODE_PRIVATE)
     private val hybridModel = HybridModel(context)
     private val riskEngine = TradeRiskEngine()
+    private val scanExecutor = Executors.newSingleThreadScheduledExecutor()
+    @Volatile private var scanTask: ScheduledFuture<*>? = null
+    @Volatile private var scanCycles = 0L
+    private val lastSignalCandle = ConcurrentHashMap<String, Long>()
+    private val lastEvaluatedCandle = ConcurrentHashMap<String, Long>()
+    private val paperLock = Any()
+    private val paperTrades = mutableListOf<PaperTrade>()
+    private val paperPrefs = context.getSharedPreferences("spled_paper_account", Context.MODE_PRIVATE)
+    private val paperInitialBalance = 1000.0
+    private val paperFeePerSide = 0.0005
+    private val paperSlippagePerSide = 0.0005
+    private val paperMaxOpenPositions = 5
+    private val paperRiskFraction = 0.005
+    private val paperMaxNotionalFraction = 0.20
     private val flushMarkets = Runnable {
         if (pendingMarkets.isNotEmpty()) {
             val rows = JSONArray()
@@ -66,7 +88,12 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         if (running) return
         running = true
         restoreHistory()
+        restorePaperTrades()
         emitStatus("DISCOVERING_BINANCE_CONTRACTS")
+        scanTask?.cancel(false)
+        scanTask = scanExecutor.scheduleAtFixedRate({
+            if (running) runOneSecondScan()
+        }, 0, 1, TimeUnit.SECONDS)
         Thread {
             try {
                 val req = Request.Builder().url("$rest/fapi/v1/exchangeInfo").build()
@@ -217,7 +244,9 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         }
         for (i in 0 until rows.length()) {
             val x = rows.optJSONObject(i) ?: continue
-            val m = markets[x.optString("s")] ?: continue
+            val symbol = x.optString("s")
+            if (!knownSymbols.contains(symbol)) continue
+            val m = markets.getOrPut(symbol) { Market(symbol) }
             m.bid = x.optString("b").toDoubleOrNull()
             m.ask = x.optString("a").toDoubleOrNull()
             val bid = m.bid ?: continue
@@ -243,8 +272,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         }
         val market = markets[symbol]
         if (market != null) {
-            val snapshot = q.toList()
-            evaluate(symbol, snapshot, market)
+            val snapshot = synchronized(q) { q.toList() }
             resolveIdeasOnClosedCandle(symbol, candle)
         }
     }
@@ -310,6 +338,8 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         if (last.c<rangeLo && volRatio>=1.25) setups.add(Triple("RANGE_EXPANSION","SHORT",69.0))
         for ((mode, side, score) in setups) {
             val now = System.currentTimeMillis()
+            val setupKey = "$symbol:$mode:$side"
+            if (lastSignalCandle[setupKey] == last.t) continue
             val duplicateActive = ideas.values.any { it.symbol==symbol && it.mode==mode && it.direction==side && it.status=="ACTIVE" && now-it.created<180_000 }
             if (duplicateActive) continue
             val entry = if (side=="LONG") (m.ask ?: price) else (m.bid ?: price)
@@ -317,8 +347,22 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             val stop = if (side=="LONG") low.takeLast(8).minOrNull()!!-buffer else high.takeLast(8).maxOrNull()!!+buffer
             val risk = abs(entry-stop)
             if (risk<=0) continue
-            val target = if (side=="LONG") entry+max(risk*1.6,entry*.003) else entry-max(risk*1.6,entry*.003)
-            if (target<=0) continue
+            // Prefer the nearest visible structural obstacle when it offers enough room.
+            // Otherwise use the project's 0.7% reference target, but never below 1.6R.
+            val minimumReward = max(risk * 1.6, entry * .007)
+            val structuralTarget = if (side == "LONG") {
+                high.dropLast(1).takeLast(60).filter { it > entry }.minOrNull()
+            } else {
+                low.dropLast(1).takeLast(60).filter { it < entry }.maxOrNull()
+            }
+            val target = if (structuralTarget != null && abs(structuralTarget - entry) >= minimumReward) {
+                structuralTarget
+            } else if (side == "LONG") {
+                entry + minimumReward
+            } else {
+                entry - minimumReward
+            }
+            if (target <= 0.0) continue
             val assessment = riskEngine.assess(entry,stop,target,m.spread ?: Double.POSITIVE_INFINITY,
                 m.volume ?: 0.0,System.currentTimeMillis()-m.received)
             if (!assessment.allowed) continue
@@ -338,13 +382,17 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             )
             listOf("BREAKOUT_RETEST","EMA_TREND_PULLBACK","MOMENTUM_EXPANSION","BOLLINGER_MEAN_REVERSION","VWAP_RECLAIM","MACD_MOMENTUM_CROSS","RANGE_EXPANSION").forEach { featureMap["strategy_$it"] = if (it==mode) 1.0 else 0.0 }
             val aiProbability = hybridModel.probability(featureMap)
-            val reasons = mutableListOf("$mode condition detected on a closed 1m candle","EMA 9/21 direction: $direction","Volume ratio: %.2fx".format(volRatio),"ATR(14) structural stop applied","Net R:R %.2f after assumed %.2f%% round-trip costs".format(netRr,assessment.estimatedRoundTripCostPct*100))
+            val targetReason = if (structuralTarget != null && target == structuralTarget) "Target references nearest visible swing obstacle" else "Target uses 0.7% reference or 1.6R minimum"
+            val reasons = mutableListOf("$mode condition detected on a closed 1m candle","EMA 9/21 direction: $direction","Volume ratio: %.2fx".format(volRatio),"Structural swing stop with ATR buffer","$targetReason","Net R:R %.2f after assumed %.2f%% round-trip costs".format(netRr,assessment.estimatedRoundTripCostPct*100))
             if (aiProbability != null) reasons.add("On-device calibrated shadow-model estimate: %.1f%%".format(aiProbability*100))
             else reasons.add("AI model unavailable or not validated; rule rank is not win probability")
             val idea = Idea(symbol,side,mode,score.coerceAtMost(95.0),entry,target,stop,rr,
                 reasons, System.currentTimeMillis(), aiProbability=aiProbability, aiStatus=hybridModel.status(), createdCandleTime=last.t)
             ideas["$symbol:$mode:$side:${last.t}"]=idea
+            lastSignalCandle[setupKey] = last.t
+            if (lastSignalCandle.size > 12000) lastSignalCandle.clear()
             emitSignal(idea)
+            openPaperTrade(idea, m)
         }
     }
 
@@ -365,6 +413,172 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             else continue
             emitSignal(idea)
         }
+    }
+
+    /** Re-evaluates cached live market state every second; strategy signals remain candle-confirmed. */
+    private fun runOneSecondScan() {
+        if (!running) return
+        var evaluated = 0
+        var checked = 0
+        for (m in markets.values) {
+            if (!running) return
+            try {
+                val q = candles[m.symbol]
+                if (q != null && (System.currentTimeMillis() - m.received) <= 10_000L) {
+                    checked++
+                    val snapshot = synchronized(q) { q.toList() }
+                    val latestClosed = snapshot.lastOrNull()?.t
+                    if (snapshot.size >= 60 && latestClosed != null && lastEvaluatedCandle[m.symbol] != latestClosed) {
+                        evaluate(m.symbol, snapshot, m)
+                        lastEvaluatedCandle[m.symbol] = latestClosed
+                        evaluated++
+                    }
+                }
+                updatePaperPositions(m)
+            } catch (_: Exception) {
+                // A malformed/stale symbol must not stop the one-second scanner loop.
+            }
+        }
+        scanCycles++
+        send("message", JSONObject().put("type", "scan_tick")
+            .put("scan_cycles", scanCycles).put("evaluated_pairs", evaluated)
+            .put("checked_pairs", checked).put("eligible_pairs", eligibleCount).put("received_markets", markets.size)
+            .put("timestamp", System.currentTimeMillis()).toString())
+        emitPaperSnapshot()
+    }
+
+    private fun openPaperTrade(idea: Idea, market: Market) {
+        synchronized(paperLock) {
+            if (paperTrades.count { it.status == "OPEN" } >= paperMaxOpenPositions) return
+            if (paperTrades.any { it.status == "OPEN" && it.symbol == idea.symbol }) return
+            val entry = if (idea.direction == "LONG") market.ask ?: return else market.bid ?: return
+            val stopDistance = abs(entry - idea.stop)
+            if (entry <= 0.0 || stopDistance <= 0.0) return
+            val equity = paperEquityLocked()
+            if (equity <= 0.0) return
+            val riskBudget = equity * paperRiskFraction
+            val estimatedRoundTripCostPerUnit = entry * 2.0 * (paperFeePerSide + paperSlippagePerSide)
+            val quantityByRisk = riskBudget / (stopDistance + estimatedRoundTripCostPerUnit)
+            val quantityByNotional = (equity * paperMaxNotionalFraction) / entry
+            val quantity = min(quantityByRisk, quantityByNotional)
+            if (!quantity.isFinite() || quantity <= 0.0) return
+            val trade = PaperTrade(
+                id = "${idea.symbol}:${idea.created}", symbol = idea.symbol,
+                direction = idea.direction, mode = idea.mode, entry = entry,
+                target = idea.target, stop = idea.stop, quantity = quantity,
+                riskUsd = (stopDistance + estimatedRoundTripCostPerUnit) * quantity, openedAt = System.currentTimeMillis()
+            )
+            paperTrades.add(0, trade)
+            persistPaperLocked()
+        }
+        emitPaperSnapshot()
+    }
+
+    private fun updatePaperPositions(market: Market) {
+        var changed = false
+        synchronized(paperLock) {
+            val now = System.currentTimeMillis()
+            for (trade in paperTrades.filter { it.status == "OPEN" && it.symbol == market.symbol }) {
+                if (now - market.received > 10_000L) continue
+                val last = market.price ?: continue
+                val long = trade.direction == "LONG"
+                val stopHit = if (long) last <= trade.stop else last >= trade.stop
+                val targetHit = if (long) last >= trade.target else last <= trade.target
+                val timeHit = now - trade.openedAt >= 4L * 60L * 60L * 1000L
+                if (stopHit || targetHit || timeHit) {
+                    val exit = if (long) (market.bid ?: last) else (market.ask ?: last)
+                    closePaperTradeLocked(trade, exit, when {
+                        stopHit -> "STOP_HIT"
+                        targetHit -> "TARGET_HIT"
+                        else -> "TIME_EXIT"
+                    }, now)
+                    changed = true
+                }
+            }
+            if (changed) persistPaperLocked()
+        }
+        if (changed) emitPaperSnapshot()
+    }
+
+    private fun closePaperTradeLocked(trade: PaperTrade, exit: Double, status: String, now: Long) {
+        val direction = if (trade.direction == "LONG") 1.0 else -1.0
+        val gross = (exit - trade.entry) * trade.quantity * direction
+        val fees = (trade.entry + exit) * trade.quantity * paperFeePerSide
+        val slippage = (trade.entry + exit) * trade.quantity * paperSlippagePerSide
+        trade.exitPrice = exit
+        trade.netPnl = gross - fees - slippage
+        trade.status = status
+        trade.closedAt = now
+    }
+
+    private fun paperUnrealizedLocked(): Double {
+        var total = 0.0
+        for (trade in paperTrades.filter { it.status == "OPEN" }) {
+            val market = markets[trade.symbol] ?: continue
+            if (System.currentTimeMillis() - market.received > 10_000L) continue
+            val mark = if (trade.direction == "LONG") (market.bid ?: market.price) else (market.ask ?: market.price)
+            if (mark != null) {
+                val dir = if (trade.direction == "LONG") 1.0 else -1.0
+                val gross = (mark - trade.entry) * trade.quantity * dir
+                val estimatedExitCosts = (trade.entry + mark) * trade.quantity * (paperFeePerSide + paperSlippagePerSide)
+                total += gross - estimatedExitCosts
+            }
+        }
+        return total
+    }
+
+    private fun paperRealizedLocked(): Double = paperTrades.filter { it.status != "OPEN" }.sumOf { it.netPnl ?: 0.0 }
+    private fun paperEquityLocked(): Double = paperInitialBalance + paperRealizedLocked() + paperUnrealizedLocked()
+
+    private fun paperTradeJson(t: PaperTrade): JSONObject = JSONObject()
+        .put("id", t.id).put("symbol", t.symbol).put("direction", t.direction).put("mode", t.mode)
+        .put("entry", t.entry).put("target", t.target).put("stop", t.stop).put("quantity", t.quantity)
+        .put("risk_usdt", t.riskUsd).put("opened_at", t.openedAt).put("status", t.status)
+        .put("exit_price", t.exitPrice).put("net_pnl", t.netPnl).put("closed_at", t.closedAt)
+
+    private fun emitPaperSnapshot() {
+        val payload = synchronized(paperLock) {
+            val open = JSONArray(); val closed = JSONArray()
+            paperTrades.filter { it.status == "OPEN" }.forEach { open.put(paperTradeJson(it)) }
+            paperTrades.filter { it.status != "OPEN" }.take(100).forEach { closed.put(paperTradeJson(it)) }
+            JSONObject().put("type", "paper_update")
+                .put("initial_balance", paperInitialBalance)
+                .put("realized_pnl", paperRealizedLocked())
+                .put("unrealized_pnl", paperUnrealizedLocked())
+                .put("equity", paperEquityLocked())
+                .put("open_positions", open).put("closed_trades", closed)
+                .put("max_positions", paperMaxOpenPositions)
+                .put("fee_per_side_pct", paperFeePerSide * 100.0)
+                .put("slippage_per_side_pct", paperSlippagePerSide * 100.0)
+                .put("leverage", 1)
+        }
+        send("message", payload.toString())
+    }
+
+    private fun restorePaperTrades() {
+        synchronized(paperLock) {
+            try {
+                val arr = JSONArray(paperPrefs.getString("trades", "[]") ?: "[]")
+                for (i in 0 until arr.length()) {
+                    val x = arr.optJSONObject(i) ?: continue
+                    paperTrades.add(PaperTrade(
+                        id=x.optString("id"), symbol=x.optString("symbol"), direction=x.optString("direction"),
+                        mode=x.optString("mode"), entry=x.optDouble("entry"), target=x.optDouble("target"),
+                        stop=x.optDouble("stop"), quantity=x.optDouble("quantity"), riskUsd=x.optDouble("risk_usdt"),
+                        openedAt=x.optLong("opened_at"), status=x.optString("status", "OPEN"),
+                        exitPrice=if (x.isNull("exit_price")) null else x.optDouble("exit_price"),
+                        netPnl=if (x.isNull("net_pnl")) null else x.optDouble("net_pnl"),
+                        closedAt=if (x.isNull("closed_at")) null else x.optLong("closed_at")
+                    ))
+                }
+            } catch (_: Exception) { paperTrades.clear() }
+        }
+    }
+
+    private fun persistPaperLocked() {
+        val arr = JSONArray()
+        paperTrades.take(300).forEach { arr.put(paperTradeJson(it)) }
+        paperPrefs.edit().putString("trades", arr.toString()).apply()
     }
 
     private fun restoreHistory() {
@@ -390,6 +604,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         data.put("markets",ma); data.put("signals",si); data.put("history",loadHistory(si))
         data.put("universe_count",eligibleCount); data.put("local_mode",true); data.put("ai_model_status",hybridModel.status())
         send("message",JSONObject().put("type","snapshot").put("data",data).toString())
+        emitPaperSnapshot()
     }
     private fun emitMarket(m: Market) {
         pendingMarkets[m.symbol]=marketJson(m)
@@ -443,6 +658,9 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
     private fun startAfterFailure() { running=false; start() }
     fun stop() {
         running=false
+        scanTask?.cancel(true)
+        scanTask = null
+        scanExecutor.shutdownNow()
         main.removeCallbacks(flushMarkets)
         sockets.values.forEach { it.close(1000,"user stopped local scanner") }
         sockets.clear()
