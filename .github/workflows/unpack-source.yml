@@ -1,72 +1,33 @@
-name: SPLED INTELLIGENCE v1.0.0 - Validate and Build APK
+name: SPLED INTELLIGENCE - Android CI and APK
 
-"on":
+on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
+      - codex-development
     paths:
-      - 'SPLED_INTELLIGENCE_v1.0.0_ONE_SECOND_PAPER_TRADING.zip'
-      - '.github/workflows/spled-v1-build.yml'
+      - 'android/**'
+      - '.github/workflows/unpack-source.yml'
 
 permissions:
   contents: read
 
-env:
-  PROJECT_DIR: /tmp/spled-release/SPLED_INTELLIGENCE
-
 concurrency:
-  group: spled-v1-build-${{ github.ref }}
+  group: spled-android-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  validate-and-build:
-    name: Validate source and build Android APK
+  android:
+    name: Test and build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Verify and extract v1.0.0 source ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARCHIVE="SPLED_INTELLIGENCE_v1.0.0_ONE_SECOND_PAPER_TRADING.zip"
-          test -s "$ARCHIVE" || { echo "Missing source ZIP: $ARCHIVE"; exit 1; }
-          unzip -t "$ARCHIVE"
-          mkdir -p /tmp/spled-release
-          unzip -q "$ARCHIVE" -d /tmp/spled-release
-          test -s "$PROJECT_DIR/README.md"
-          test -s "$PROJECT_DIR/android/settings.gradle.kts"
-          test -s "$PROJECT_DIR/android/build.gradle.kts"
-          test -s "$PROJECT_DIR/android/app/build.gradle.kts"
-          test -s "$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
-          echo "Source archive and required Android files verified."
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: |
-            SPLED_INTELLIGENCE_v1.0.0_ONE_SECOND_PAPER_TRADING.zip
-
-      - name: Install Python test dependencies
-        working-directory: /tmp/spled-release/SPLED_INTELLIGENCE
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest -r backend/requirements.txt -r backend/research/requirements.txt
-
-      - name: Compile Python and run tests
-        working-directory: /tmp/spled-release/SPLED_INTELLIGENCE
-        env:
-          PYTHONPATH: backend
-        run: |
-          set -euo pipefail
-          python -m py_compile backend/app/*.py backend/research/*.py
-          python -m pytest -q backend/tests backend/research/tests
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -89,49 +50,54 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Run Android unit tests and build debug APK
-        working-directory: /tmp/spled-release/SPLED_INTELLIGENCE/android
+      - name: Validate Android project
+        working-directory: android
+        run: |
+          test -s settings.gradle.kts
+          test -s build.gradle.kts
+          test -s app/build.gradle.kts
+          test -s app/src/main/AndroidManifest.xml
+
+      - name: Run unit tests and assemble debug APK
+        working-directory: android
         shell: bash
         run: |
           set -o pipefail
           gradle --no-daemon --stacktrace clean testDebugUnitTest assembleDebug 2>&1 | tee /tmp/spled-gradle-build.log
 
-      - name: Verify APK and calculate checksum
+      - name: Verify APK and checksum
         if: success()
-        shell: bash
         run: |
           set -euo pipefail
-          APK="$PROJECT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
           mkdir -p /tmp/spled-artifacts
-          cp "$APK" /tmp/spled-artifacts/SPLED-INTELLIGENCE-v1.0.0-debug.apk
-          sha256sum /tmp/spled-artifacts/SPLED-INTELLIGENCE-v1.0.0-debug.apk | tee /tmp/spled-artifacts/SHA256SUMS.txt
+          cp "$APK" /tmp/spled-artifacts/SPLED-INTELLIGENCE-debug.apk
+          sha256sum /tmp/spled-artifacts/SPLED-INTELLIGENCE-debug.apk > /tmp/spled-artifacts/SHA256SUMS.txt
           ls -lh /tmp/spled-artifacts/
 
-      - name: Collect diagnostic logs and test reports
+      - name: Collect diagnostics
         if: always()
-        shell: bash
         run: |
           mkdir -p /tmp/spled-artifacts/diagnostics
           if [ -f /tmp/spled-gradle-build.log ]; then cp /tmp/spled-gradle-build.log /tmp/spled-artifacts/diagnostics/; fi
-          if [ -d "$PROJECT_DIR/android/app/build/reports" ]; then cp -r "$PROJECT_DIR/android/app/build/reports" /tmp/spled-artifacts/diagnostics/; fi
-          if [ -d "$PROJECT_DIR/android/app/build/test-results" ]; then cp -r "$PROJECT_DIR/android/app/build/test-results" /tmp/spled-artifacts/diagnostics/; fi
-          if [ -d "$PROJECT_DIR/android/.gradle" ]; then echo 'Gradle project cache was created.' > /tmp/spled-artifacts/diagnostics/gradle-cache-note.txt; fi
+          if [ -d android/app/build/reports ]; then cp -r android/app/build/reports /tmp/spled-artifacts/diagnostics/; fi
+          if [ -d android/app/build/test-results ]; then cp -r android/app/build/test-results /tmp/spled-artifacts/diagnostics/; fi
 
-      - name: Upload installable debug APK
+      - name: Upload debug APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: SPLED-INTELLIGENCE-v1.0.0-DEBUG-APK
-          path: /tmp/spled-artifacts/SPLED-INTELLIGENCE-v1.0.0-debug.apk
+          name: SPLED-INTELLIGENCE-DEBUG-APK
+          path: /tmp/spled-artifacts/SPLED-INTELLIGENCE-debug.apk
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SPLED-INTELLIGENCE-v1.0.0-BUILD-DIAGNOSTICS
+          name: SPLED-INTELLIGENCE-BUILD-DIAGNOSTICS
           path: /tmp/spled-artifacts/diagnostics/
           if-no-files-found: warn
           retention-days: 14

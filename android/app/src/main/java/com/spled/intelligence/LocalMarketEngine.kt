@@ -32,8 +32,16 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         val symbol: String, val direction: String, val mode: String, val score: Double,
         val entry: Double, val target: Double, val stop: Double, val rr: Double,
         val reasons: List<String>, val created: Long, var status: String = "ACTIVE",
-        val aiProbability: Double? = null, val aiStatus: String = "MODEL_NOT_VALIDATED", val createdCandleTime: Long = 0L
+        val aiProbability: Double? = null, val aiStatus: String = "MODEL_NOT_VALIDATED", val createdCandleTime: Long = 0L,
+        val pullbackEntry: Double = entry, val confirmationPrice: Double = entry
     )
+    private data class FiveMinuteForecast(
+        val id: String, val symbol: String, val direction: String,
+        val entry: Double, val target: Double, val stop: Double,
+        val createdAt: Long, val createdCandleTime: Long,
+        var status: String = "PENDING", var exitPrice: Double? = null, var resolvedAt: Long = 0L
+    )
+
     private data class PaperTrade(
         val id: String, val symbol: String, val direction: String, val mode: String,
         val entry: Double, val target: Double, val stop: Double, val quantity: Double,
@@ -62,6 +70,8 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
     private val lastSignalCandle = ConcurrentHashMap<String, Long>()
     private val lastEvaluatedCandle = ConcurrentHashMap<String, Long>()
     private val paperLock = Any()
+    private val forecastLock = Any()
+    private val fiveMinuteForecasts = mutableListOf<FiveMinuteForecast>()
     private val paperTrades = mutableListOf<PaperTrade>()
     private val paperPrefs = context.getSharedPreferences("spled_paper_account", Context.MODE_PRIVATE)
     private val paperInitialBalance = 1000.0
@@ -88,6 +98,8 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         if (running) return
         running = true
         restoreHistory()
+        restoreFiveMinuteForecasts()
+        emitFiveMinuteStats()
         restorePaperTrades()
         emitStatus("DISCOVERING_BINANCE_CONTRACTS")
         scanTask?.cancel(false)
@@ -115,10 +127,11 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     emitStatus("DISCOVERED_${symbols.size}_USDT_PERPETUALS")
                     connect("ticker", "$ws/ws/!ticker@arr")
                     connect("book", "$ws/ws/!bookTicker")
+                    // Start live candle streams immediately; REST warm-up must not block them.
+                    if (running) subscribeKlines(symbols)
                     Thread {
                         warmup(symbols)
-                        if (running) subscribeKlines(symbols)
-                        emitSnapshot()
+                        if (running) emitSnapshot()
                     }.start()
                     Thread { refreshUniverseLoop() }.start()
                 }
@@ -168,28 +181,43 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
     }
 
     private fun warmup(symbols: List<String>) {
-        // Gentle sequential warm-up: 80 x 1m candles per contract. Public REST only.
-        for (symbol in symbols) {
-            if (!running) return
-            try {
-                val url = "$rest/fapi/v1/klines?symbol=$symbol&interval=1m&limit=80"
-                val req = Request.Builder().url(url).build()
-                client.newCall(req).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val a = JSONArray(response.body?.string() ?: "[]")
-                        val q = ArrayDeque<Candle>()
-                        for (i in 0 until max(0, a.length() - 1)) {
-                            val row = a.optJSONArray(i) ?: continue
-                            if (row.length() < 6) continue
-                            q.add(Candle(row.optLong(0), row.optString(1).toDoubleOrNull() ?: 0.0,
-                                row.optString(2).toDoubleOrNull() ?: 0.0, row.optString(3).toDoubleOrNull() ?: 0.0,
-                                row.optString(4).toDoubleOrNull() ?: 0.0, row.optString(5).toDoubleOrNull() ?: 0.0))
+        // Bounded parallel warm-up: avoid hundreds of sequential HTTP calls delaying candle readiness.
+        val pool = Executors.newFixedThreadPool(8)
+        try {
+            val jobs = symbols.map { symbol ->
+                pool.submit {
+                    if (!running) return@submit
+                    try {
+                        val url = "$rest/fapi/v1/klines?symbol=$symbol&interval=1m&limit=80"
+                        val req = Request.Builder().url(url).build()
+                        client.newCall(req).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val a = JSONArray(response.body?.string() ?: "[]")
+                                val q = ArrayDeque<Candle>()
+                                for (i in 0 until max(0, a.length() - 1)) {
+                                    val row = a.optJSONArray(i) ?: continue
+                                    if (row.length() < 6) continue
+                                    q.add(Candle(row.optLong(0), row.optString(1).toDoubleOrNull() ?: 0.0,
+                                        row.optString(2).toDoubleOrNull() ?: 0.0, row.optString(3).toDoubleOrNull() ?: 0.0,
+                                        row.optString(4).toDoubleOrNull() ?: 0.0, row.optString(5).toDoubleOrNull() ?: 0.0))
+                                }
+                                if (q.isNotEmpty()) {
+                                    val live = candles[symbol]
+                                    if (live == null) candles[symbol] = q
+                                    else synchronized(live) {
+                                        val merged = (q.toList() + live.toList()).distinctBy { it.t }.sortedBy { it.t }.takeLast(300)
+                                        live.clear()
+                                        live.addAll(merged)
+                                    }
+                                }
+                            }
                         }
-                        if (q.isNotEmpty()) candles[symbol] = q
-                    }
+                    } catch (_: Exception) { /* live kline stream can still populate this symbol */ }
                 }
-            } catch (_: Exception) { /* symbol will become ready after enough live candles */ }
-            try { Thread.sleep(120) } catch (_: InterruptedException) { return }
+            }
+            jobs.forEach { try { it.get() } catch (_: Exception) { } }
+        } finally {
+            pool.shutdownNow()
         }
     }
 
@@ -270,6 +298,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             q.addLast(candle)
             while (q.size > 300) q.removeFirst()
         }
+        resolveFiveMinuteForecasts(symbol, candle)
         val market = markets[symbol]
         if (market != null) {
             val snapshot = synchronized(q) { q.toList() }
@@ -287,6 +316,9 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         val atr = atr(c)
         val volBase = vol.takeLast(23).dropLast(3).average().coerceAtLeast(1e-12)
         val volRatio = vol.takeLast(3).average() / volBase
+        val atrPct = atr / price * 100.0
+        // Hard minimum activity filters requested for live signals.
+        if (atrPct < 0.80 || volRatio < 1.50) return
         val recentHigh = high.dropLast(1).takeLast(20).maxOrNull() ?: return
         val recentLow = low.dropLast(1).takeLast(20).minOrNull() ?: return
         val last = c.last(); val prev = c[c.size - 2]
@@ -343,6 +375,14 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             val duplicateActive = ideas.values.any { it.symbol==symbol && it.mode==mode && it.direction==side && it.status=="ACTIVE" && now-it.created<180_000 }
             if (duplicateActive) continue
             val entry = if (side=="LONG") (m.ask ?: price) else (m.bid ?: price)
+            // Planned pullback entry: wait for a partial ATR retracement toward EMA21.
+            // Then require a small reversal through the confirmation level before entry.
+            val pullbackEntry = if (side=="LONG") {
+                min(entry, max(slow, entry - atr * 0.50))
+            } else {
+                max(entry, min(slow, entry + atr * 0.50))
+            }
+            val confirmationPrice = if (side=="LONG") pullbackEntry + atr * 0.15 else pullbackEntry - atr * 0.15
             val buffer = max(atr*.15, entry*.0002)
             val stop = if (side=="LONG") low.takeLast(8).minOrNull()!!-buffer else high.takeLast(8).maxOrNull()!!+buffer
             val risk = abs(entry-stop)
@@ -383,11 +423,13 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             listOf("BREAKOUT_RETEST","EMA_TREND_PULLBACK","MOMENTUM_EXPANSION","BOLLINGER_MEAN_REVERSION","VWAP_RECLAIM","MACD_MOMENTUM_CROSS","RANGE_EXPANSION").forEach { featureMap["strategy_$it"] = if (it==mode) 1.0 else 0.0 }
             val aiProbability = hybridModel.probability(featureMap)
             val targetReason = if (structuralTarget != null && target == structuralTarget) "Target references nearest visible swing obstacle" else "Target uses 0.7% reference or 1.6R minimum"
-            val reasons = mutableListOf("$mode condition detected on a closed 1m candle","EMA 9/21 direction: $direction","Volume ratio: %.2fx".format(volRatio),"Structural swing stop with ATR buffer","$targetReason","Net R:R %.2f after assumed %.2f%% round-trip costs".format(netRr,assessment.estimatedRoundTripCostPct*100))
+            val pullbackText = if (side=="LONG") "Wait for dip to %.8f, then rebound above %.8f" else "Wait for rise to %.8f, then rejection below %.8f"
+            val reasons = mutableListOf("$mode condition detected on a closed 1m candle","ATR: %.2f%% (minimum 0.80%%) · Volume: %.2fx (minimum 1.50x)".format(atrPct,volRatio),pullbackText.format(pullbackEntry,confirmationPrice),"Structural swing stop with ATR buffer","$targetReason","Net R:R %.2f after assumed %.2f%% round-trip costs".format(netRr,assessment.estimatedRoundTripCostPct*100))
             if (aiProbability != null) reasons.add("On-device calibrated shadow-model estimate: %.1f%%".format(aiProbability*100))
             else reasons.add("AI model unavailable or not validated; rule rank is not win probability")
             val idea = Idea(symbol,side,mode,score.coerceAtMost(95.0),entry,target,stop,rr,
-                reasons, System.currentTimeMillis(), aiProbability=aiProbability, aiStatus=hybridModel.status(), createdCandleTime=last.t)
+                reasons, System.currentTimeMillis(), aiProbability=aiProbability, aiStatus=hybridModel.status(), createdCandleTime=last.t,
+                pullbackEntry=pullbackEntry, confirmationPrice=confirmationPrice)
             ideas["$symbol:$mode:$side:${last.t}"]=idea
             lastSignalCandle[setupKey] = last.t
             if (lastSignalCandle.size > 12000) lastSignalCandle.clear()
@@ -413,6 +455,175 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             else continue
             emitSignal(idea)
         }
+    }
+
+    /** One-shot directional scan using the latest closed 1m candles and fresh live quotes. */
+    fun requestFiveMinuteScan() {
+        if (!running) {
+            send("message", JSONObject().put("type", "five_min_scan")
+                .put("status", "NOT_READY").put("message", "Scanner is not running").toString())
+            return
+        }
+        Thread {
+            val now = System.currentTimeMillis()
+            val candidates = JSONArray()
+            var checked = 0
+            var skipped = 0
+            val ranked = mutableListOf<JSONObject>()
+            for (m in markets.values) {
+                val q = candles[m.symbol]
+                if (q == null || now - m.received > 10_000L) { skipped++; continue }
+                val c = synchronized(q) { q.toList() }
+                if (c.size < 30) { skipped++; continue }
+                val last = c.last()
+                val base = c[c.size - 6].c
+                val bid = m.bid
+                val ask = m.ask
+                val mid = m.price ?: last.c
+                if (base <= 0.0 || mid <= 0.0 || bid == null || ask == null || ask < bid) { skipped++; continue }
+                checked++
+                val closes = c.map { it.c }
+                val emaFast = ema(closes.takeLast(20), 9)
+                val emaSlow = ema(closes.takeLast(30), 21)
+                val ret5 = (last.c / base - 1.0) * 100.0
+                val emaGap = (emaFast / emaSlow - 1.0) * 100.0
+                val rsiNow = rsi(closes) ?: 50.0
+                val spreadBps = m.spread ?: Double.POSITIVE_INFINITY
+                val volume = m.volume ?: 0.0
+                if (spreadBps > 15.0 || volume < 1_000_000.0) { skipped++; continue }
+                val aligned = (ret5 > 0 && emaGap > 0) || (ret5 < 0 && emaGap < 0)
+                if (!aligned || abs(ret5) < 0.025 || (ret5 > 0 && rsiNow > 78) || (ret5 < 0 && rsiNow < 22)) continue
+                val direction = if (ret5 > 0) "LONG" else "SHORT"
+                val rawMove = abs(ret5) * 0.55 + abs(emaGap) * 0.45
+                val expectedMove = rawMove.coerceIn(0.05, 0.70)
+                val entry = if (direction == "LONG") ask else bid
+                val target = if (direction == "LONG") entry * (1.0 + expectedMove / 100.0) else entry * (1.0 - expectedMove / 100.0)
+                val maxMove = (expectedMove * 1.20).coerceAtMost(0.70)
+                val maxPrice = if (direction == "LONG") entry * (1.0 + maxMove / 100.0) else entry * (1.0 - maxMove / 100.0)
+                val confluence = (5 + (if (abs(ret5) >= 0.10) 1 else 0) +
+                    (if (abs(emaGap) >= 0.025) 1 else 0) +
+                    (if (abs(ret5) >= abs(emaGap)) 1 else 0) +
+                    (if ((direction == "LONG" && rsiNow in 45.0..70.0) || (direction == "SHORT" && rsiNow in 30.0..55.0)) 1 else 0)).coerceAtMost(9)
+                val stop = if (direction == "LONG") entry * (1.0 - expectedMove / 100.0) else entry * (1.0 + expectedMove / 100.0)
+                ranked.add(JSONObject().put("symbol", m.symbol).put("direction", direction)
+                    .put("entry", entry).put("target", target).put("stop", stop).put("max_price", maxPrice)
+                    .put("expected_move_pct", expectedMove).put("max_move_pct", maxMove)
+                    .put("confluence", confluence).put("return_5m_pct", ret5)
+                    .put("spread_bps", spreadBps).put("rsi", rsiNow)
+                    .put("created_at", now).put("candle_time", last.t).put("expires_at", now + 5 * 60 * 1000L))
+            }
+            ranked.sortedWith(compareByDescending<JSONObject> { it.optInt("confluence") }
+                .thenByDescending { abs(it.optDouble("return_5m_pct")) })
+                .take(10).forEach { candidate ->
+                    candidates.put(candidate)
+                    val direction = candidate.optString("direction")
+                    val entry = candidate.optDouble("entry")
+                    val target = candidate.optDouble("target")
+                    val stop = candidate.optDouble("stop")
+                    val symbol = candidate.optString("symbol")
+                    val candleTime = candidate.optLong("candle_time")
+                    val forecast = FiveMinuteForecast(
+                        id = "$symbol:$now:$direction", symbol = symbol, direction = direction,
+                        entry = entry, target = target, stop = stop, createdAt = now,
+                        createdCandleTime = candleTime
+                    )
+                    synchronized(forecastLock) {
+                        val alreadyPending = fiveMinuteForecasts.any {
+                            it.symbol == symbol && it.status == "PENDING" && now - it.createdAt < 5L * 60L * 1000L
+                        }
+                        if (!alreadyPending) {
+                            fiveMinuteForecasts.add(0, forecast)
+                            while (fiveMinuteForecasts.size > 1000) fiveMinuteForecasts.removeAt(fiveMinuteForecasts.lastIndex)
+                            persistFiveMinuteForecastsLocked()
+                        }
+                    }
+                }
+            emitFiveMinuteStats()
+            send("message", JSONObject().put("type", "five_min_scan")
+                .put("status", if (candidates.length() > 0) "READY" else "NO_TRADE")
+                .put("checked", checked).put("skipped", skipped)
+                .put("scanned_at", now).put("signals", candidates)
+                .put("win_rate", fiveMinuteStats().optDouble("win_rate", -1.0))
+                .put("wins", fiveMinuteStats().optInt("wins"))
+                .put("losses", fiveMinuteStats().optInt("losses"))
+                .put("resolved", fiveMinuteStats().optInt("resolved"))
+                .put("pending", fiveMinuteStats().optInt("pending")).toString())
+        }.start()
+    }
+
+    private fun resolveFiveMinuteForecasts(symbol: String, candle: Candle) {
+        var changed = false
+        synchronized(forecastLock) {
+            for (forecast in fiveMinuteForecasts) {
+                if (forecast.symbol != symbol || forecast.status != "PENDING" || candle.t <= forecast.createdCandleTime) continue
+                val long = forecast.direction == "LONG"
+                val stopHit = if (long) candle.l <= forecast.stop else candle.h >= forecast.stop
+                val targetHit = if (long) candle.h >= forecast.target else candle.l <= forecast.target
+                val expired = candle.t + 60_000L >= forecast.createdAt + 5L * 60L * 1000L
+                if (stopHit || targetHit || expired) {
+                    val exit = when {
+                        stopHit -> forecast.stop
+                        targetHit -> forecast.target
+                        else -> candle.c
+                    }
+                    val direction = if (long) 1.0 else -1.0
+                    val grossPct = (exit / forecast.entry - 1.0) * direction * 100.0
+                    val estimatedRoundTripCostPct = 2.0 * (paperFeePerSide + paperSlippagePerSide) * 100.0
+                    forecast.exitPrice = exit
+                    forecast.status = if (!stopHit && grossPct > estimatedRoundTripCostPct) "WIN" else "LOSS"
+                    forecast.resolvedAt = System.currentTimeMillis()
+                    changed = true
+                }
+            }
+            if (changed) persistFiveMinuteForecastsLocked()
+        }
+        if (changed) emitFiveMinuteStats()
+    }
+
+    private fun forecastJson(f: FiveMinuteForecast): JSONObject = JSONObject()
+        .put("id", f.id).put("symbol", f.symbol).put("direction", f.direction)
+        .put("entry", f.entry).put("target", f.target).put("stop", f.stop)
+        .put("created_at", f.createdAt).put("created_candle_time", f.createdCandleTime)
+        .put("status", f.status).put("exit_price", f.exitPrice).put("resolved_at", f.resolvedAt)
+
+    private fun restoreFiveMinuteForecasts() {
+        synchronized(forecastLock) {
+            try {
+                val saved = JSONArray(prefs.getString("five_minute_forecasts", "[]") ?: "[]")
+                for (i in 0 until saved.length()) {
+                    val x = saved.optJSONObject(i) ?: continue
+                    fiveMinuteForecasts.add(FiveMinuteForecast(
+                        id = x.optString("id"), symbol = x.optString("symbol"),
+                        direction = x.optString("direction"), entry = x.optDouble("entry"),
+                        target = x.optDouble("target"), stop = x.optDouble("stop"),
+                        createdAt = x.optLong("created_at"), createdCandleTime = x.optLong("created_candle_time"),
+                        status = x.optString("status", "PENDING"),
+                        exitPrice = if (x.isNull("exit_price")) null else x.optDouble("exit_price"),
+                        resolvedAt = x.optLong("resolved_at")
+                    ))
+                }
+            } catch (_: Exception) { fiveMinuteForecasts.clear() }
+        }
+    }
+
+    private fun persistFiveMinuteForecastsLocked() {
+        val saved = JSONArray()
+        fiveMinuteForecasts.take(1000).forEach { saved.put(forecastJson(it)) }
+        prefs.edit().putString("five_minute_forecasts", saved.toString()).apply()
+    }
+
+    private fun fiveMinuteStats(): JSONObject = synchronized(forecastLock) {
+        val wins = fiveMinuteForecasts.count { it.status == "WIN" }
+        val losses = fiveMinuteForecasts.count { it.status == "LOSS" }
+        val resolved = wins + losses
+        JSONObject().put("wins", wins).put("losses", losses).put("resolved", resolved)
+            .put("pending", fiveMinuteForecasts.count { it.status == "PENDING" })
+            .put("win_rate", if (resolved > 0) wins.toDouble() / resolved * 100.0 else -1.0)
+    }
+
+    private fun emitFiveMinuteStats() {
+        val stats = fiveMinuteStats().put("type", "five_min_stats")
+        send("message", stats.toString())
     }
 
     /** Re-evaluates cached live market state every second; strategy signals remain candle-confirmed. */
@@ -591,7 +802,9 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     x.optDouble("structural_stop_reference"),x.optDouble("risk_reward"),
                     (0 until (x.optJSONArray("rationale")?.length() ?: 0)).map { x.getJSONArray("rationale").optString(it) },
                     (x.optDouble("created_at")*1000).toLong(),x.optString("status","ACTIVE"),
-                    if (x.isNull("ai_probability")) null else x.optDouble("ai_probability"),x.optString("ai_status","MODEL_NOT_VALIDATED"),x.optLong("created_candle_time"))
+                    if (x.isNull("ai_probability")) null else x.optDouble("ai_probability"),x.optString("ai_status","MODEL_NOT_VALIDATED"),x.optLong("created_candle_time"),
+                    x.optDouble("pullback_entry_reference", x.optDouble("entry_reference")),
+                    x.optDouble("confirmation_reference", x.optDouble("entry_reference")))
                 ideas["${idea.symbol}:${idea.mode}:${idea.direction}:${idea.createdCandleTime}"]=idea
             }
         } catch (_: Exception) { }
@@ -646,6 +859,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         .put("data_age_seconds",max(0L,System.currentTimeMillis()-m.received)/1000.0)
     private fun ideaJson(i: Idea)=JSONObject().put("symbol",i.symbol).put("direction",i.direction).put("mode",i.mode)
         .put("score",i.score).put("entry_reference",i.entry).put("target_reference",i.target)
+        .put("pullback_entry_reference",i.pullbackEntry).put("confirmation_reference",i.confirmationPrice)
         .put("structural_stop_reference",i.stop).put("risk_reward",i.rr).put("rationale",JSONArray(i.reasons))
         .put("invalidation",JSONArray(listOf("Cancel if spread widens above 15 bps","Reassess if market feed becomes stale")))
         .put("probability_status",if(i.aiProbability!=null) "SHADOW_MODEL_ESTIMATE_NOT_LIVE_APPROVED" else "RULE_BASED_NOT_VALIDATED")
