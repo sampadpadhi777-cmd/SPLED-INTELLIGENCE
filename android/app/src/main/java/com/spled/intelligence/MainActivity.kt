@@ -83,7 +83,9 @@ private data class Opportunity(
     val aiProbability: Double?,
     val createdAt: Double,
     val reasons: List<String>,
-    val invalidation: List<String>
+    val invalidation: List<String>,
+    val pullbackEntry: Double = entry,
+    val confirmationPrice: Double = entry
 ) {
     val key: String get() = "$symbol:$direction:$mode:$createdAt"
 }
@@ -353,9 +355,13 @@ private fun SignalCard(s: Opportunity, rank: Int) {
             }
             Text(s.mode.replace('_', ' '), color = Muted, fontSize = 10.sp, letterSpacing = .5.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                PriceTile("ENTRY", s.entry, Modifier.weight(1f), Mint)
-                PriceTile("TARGET", s.target, Modifier.weight(1f), Mint)
+                PriceTile("LIVE PRICE", s.entry, Modifier.weight(1f), White)
+                PriceTile("TARGET EXIT", s.target, Modifier.weight(1f), Mint)
                 PriceTile("STOP LOSS", s.stop, Modifier.weight(1f), Red)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                PriceTile(if (long) "WAIT FOR DIP" else "WAIT FOR RISE", s.pullbackEntry, Modifier.weight(1f), Amber)
+                PriceTile(if (long) "CONFIRM ABOVE" else "CONFIRM BELOW", s.confirmationPrice, Modifier.weight(1f), Mint)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Risk / Reward", color = Muted, fontSize = 10.sp)
