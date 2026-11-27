@@ -32,7 +32,8 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         val symbol: String, val direction: String, val mode: String, val score: Double,
         val entry: Double, val target: Double, val stop: Double, val rr: Double,
         val reasons: List<String>, val created: Long, var status: String = "ACTIVE",
-        val aiProbability: Double? = null, val aiStatus: String = "MODEL_NOT_VALIDATED", val createdCandleTime: Long = 0L
+        val aiProbability: Double? = null, val aiStatus: String = "MODEL_NOT_VALIDATED", val createdCandleTime: Long = 0L,
+        val pullbackEntry: Double = entry, val confirmationPrice: Double = entry
     )
     private data class FiveMinuteForecast(
         val id: String, val symbol: String, val direction: String,
@@ -315,6 +316,9 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         val atr = atr(c)
         val volBase = vol.takeLast(23).dropLast(3).average().coerceAtLeast(1e-12)
         val volRatio = vol.takeLast(3).average() / volBase
+        val atrPct = atr / price * 100.0
+        // Hard minimum activity filters requested for live signals.
+        if (atrPct < 0.80 || volRatio < 1.50) return
         val recentHigh = high.dropLast(1).takeLast(20).maxOrNull() ?: return
         val recentLow = low.dropLast(1).takeLast(20).minOrNull() ?: return
         val last = c.last(); val prev = c[c.size - 2]
@@ -371,6 +375,14 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             val duplicateActive = ideas.values.any { it.symbol==symbol && it.mode==mode && it.direction==side && it.status=="ACTIVE" && now-it.created<180_000 }
             if (duplicateActive) continue
             val entry = if (side=="LONG") (m.ask ?: price) else (m.bid ?: price)
+            // Planned pullback entry: wait for a partial ATR retracement toward EMA21.
+            // Then require a small reversal through the confirmation level before entry.
+            val pullbackEntry = if (side=="LONG") {
+                min(entry, max(slow, entry - atr * 0.50))
+            } else {
+                max(entry, min(slow, entry + atr * 0.50))
+            }
+            val confirmationPrice = if (side=="LONG") pullbackEntry + atr * 0.15 else pullbackEntry - atr * 0.15
             val buffer = max(atr*.15, entry*.0002)
             val stop = if (side=="LONG") low.takeLast(8).minOrNull()!!-buffer else high.takeLast(8).maxOrNull()!!+buffer
             val risk = abs(entry-stop)
@@ -411,11 +423,13 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
             listOf("BREAKOUT_RETEST","EMA_TREND_PULLBACK","MOMENTUM_EXPANSION","BOLLINGER_MEAN_REVERSION","VWAP_RECLAIM","MACD_MOMENTUM_CROSS","RANGE_EXPANSION").forEach { featureMap["strategy_$it"] = if (it==mode) 1.0 else 0.0 }
             val aiProbability = hybridModel.probability(featureMap)
             val targetReason = if (structuralTarget != null && target == structuralTarget) "Target references nearest visible swing obstacle" else "Target uses 0.7% reference or 1.6R minimum"
-            val reasons = mutableListOf("$mode condition detected on a closed 1m candle","EMA 9/21 direction: $direction","Volume ratio: %.2fx".format(volRatio),"Structural swing stop with ATR buffer","$targetReason","Net R:R %.2f after assumed %.2f%% round-trip costs".format(netRr,assessment.estimatedRoundTripCostPct*100))
+            val pullbackText = if (side=="LONG") "Wait for dip to %.8f, then rebound above %.8f" else "Wait for rise to %.8f, then rejection below %.8f"
+            val reasons = mutableListOf("$mode condition detected on a closed 1m candle","ATR: %.2f%% (minimum 0.80%%) · Volume: %.2fx (minimum 1.50x)".format(atrPct,volRatio),pullbackText.format(pullbackEntry,confirmationPrice),"Structural swing stop with ATR buffer","$targetReason","Net R:R %.2f after assumed %.2f%% round-trip costs".format(netRr,assessment.estimatedRoundTripCostPct*100))
             if (aiProbability != null) reasons.add("On-device calibrated shadow-model estimate: %.1f%%".format(aiProbability*100))
             else reasons.add("AI model unavailable or not validated; rule rank is not win probability")
             val idea = Idea(symbol,side,mode,score.coerceAtMost(95.0),entry,target,stop,rr,
-                reasons, System.currentTimeMillis(), aiProbability=aiProbability, aiStatus=hybridModel.status(), createdCandleTime=last.t)
+                reasons, System.currentTimeMillis(), aiProbability=aiProbability, aiStatus=hybridModel.status(), createdCandleTime=last.t,
+                pullbackEntry=pullbackEntry, confirmationPrice=confirmationPrice)
             ideas["$symbol:$mode:$side:${last.t}"]=idea
             lastSignalCandle[setupKey] = last.t
             if (lastSignalCandle.size > 12000) lastSignalCandle.clear()
@@ -843,6 +857,7 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
         .put("data_age_seconds",max(0L,System.currentTimeMillis()-m.received)/1000.0)
     private fun ideaJson(i: Idea)=JSONObject().put("symbol",i.symbol).put("direction",i.direction).put("mode",i.mode)
         .put("score",i.score).put("entry_reference",i.entry).put("target_reference",i.target)
+        .put("pullback_entry_reference",i.pullbackEntry).put("confirmation_reference",i.confirmationPrice)
         .put("structural_stop_reference",i.stop).put("risk_reward",i.rr).put("rationale",JSONArray(i.reasons))
         .put("invalidation",JSONArray(listOf("Cancel if spread widens above 15 bps","Reassess if market feed becomes stale")))
         .put("probability_status",if(i.aiProbability!=null) "SHADOW_MODEL_ESTIMATE_NOT_LIVE_APPROVED" else "RULE_BASED_NOT_VALIDATED")
