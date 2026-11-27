@@ -802,7 +802,9 @@ class LocalMarketEngine(private val context: Context, private val onEvent: (Stri
                     x.optDouble("structural_stop_reference"),x.optDouble("risk_reward"),
                     (0 until (x.optJSONArray("rationale")?.length() ?: 0)).map { x.getJSONArray("rationale").optString(it) },
                     (x.optDouble("created_at")*1000).toLong(),x.optString("status","ACTIVE"),
-                    if (x.isNull("ai_probability")) null else x.optDouble("ai_probability"),x.optString("ai_status","MODEL_NOT_VALIDATED"),x.optLong("created_candle_time"))
+                    if (x.isNull("ai_probability")) null else x.optDouble("ai_probability"),x.optString("ai_status","MODEL_NOT_VALIDATED"),x.optLong("created_candle_time"),
+                    x.optDouble("pullback_entry_reference", x.optDouble("entry_reference")),
+                    x.optDouble("confirmation_reference", x.optDouble("entry_reference")))
                 ideas["${idea.symbol}:${idea.mode}:${idea.direction}:${idea.createdCandleTime}"]=idea
             }
         } catch (_: Exception) { }
