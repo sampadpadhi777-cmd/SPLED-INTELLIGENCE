@@ -603,7 +603,9 @@ private fun parseSignal(x: JSONObject) = Opportunity(
     mode = x.optString("mode"), status = x.optString("status", "ACTIVE"),
     aiStatus = x.optString("ai_status", "MODEL_NOT_VALIDATED"), aiProbability = x.doubleOrNull("ai_probability"),
     createdAt = x.optDouble("created_at"), reasons = x.optJSONArray("rationale").toStringList(),
-    invalidation = x.optJSONArray("invalidation").toStringList()
+    invalidation = x.optJSONArray("invalidation").toStringList(),
+    pullbackEntry = x.optDouble("pullback_entry_reference", x.optDouble("entry_reference")),
+    confirmationPrice = x.optDouble("confirmation_reference", x.optDouble("entry_reference"))
 )
 
 private fun JSONObject.doubleOrNull(key: String): Double? = if (isNull(key) || !has(key)) null else optDouble(key).takeIf { it.isFinite() }
